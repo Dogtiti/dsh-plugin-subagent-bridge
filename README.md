@@ -111,7 +111,9 @@ codex mcp remove dsh-bridge
 | `maxHops` | `1` | 跨工具委派层数上限（1 = 只允许一层，和 Codex / DSH 的默认 `maxDepth: 1` 一致） |
 | `dispatchPerMinute` | `10` | 滚动窗口内允许的派发次数（spawn / task / dispatch / followup / codex_dispatch 合计） |
 | `dispatchWindowMs` | `60000` | 上述窗口长度 |
-| `maxWorkers` | `4` | **整个 App 共享**的 worker 上限；已完成但未 `dsh_close` 的也占名额（与 Codex 一致），不按会话隔离 |
+| `maxWorkersPerRoot` | `4` | **每个工作目录**的 worker 上限（`cwd` 自动分桶，调用方不需要传 owner） |
+| `maxWorkers` | `12` | 全局兜底上限，防止多个项目一起把机器压满 |
+| `workerTtlMs` | `86400000` | 记录超过这个时间没更新就不再占名额（过期自动释放，无需手动清理） |
 | `waitTimeoutMs` | `30000` | `dsh_wait` 的默认超时（1s ~ 1h，客户端可用 `timeoutMs` 覆盖） |
 | `readWaitSeconds` | `25` | `dsh_read_result` 的默认长轮询时长（上限 55，客户端可用 `waitSeconds` 覆盖） |
 | `codexBin` | `codex` | Codex 可执行文件；含 `/` 时按路径严格解析，找不到就报错而不回退 |
@@ -145,6 +147,18 @@ codex mcp remove dsh-bridge
 ```
 rate limit: 10 dispatches per 60s reached; retry in 23s
 ```
+
+## 名额怎么算
+
+worker 名额**按工作目录分桶**，调用方不用传任何 owner：
+
+- 每个 `cwd` 默认 **4 个**（`maxWorkersPerRoot`）；
+- 全局默认 **12 个**（`maxWorkers`），跨项目兜底；
+- **完成但没 `dsh_close` 的仍占名额**（与 Codex 一致）；
+- 记录 **24 小时**没更新就自动不再占名额（`workerTtlMs`），不需要手动清理；
+- 阻塞式 `dsh_task` 不计入名额，只登记。
+
+为什么不是"每个会话 4 个"：MCP 端点是共享的，请求里没有会话或线程身份（Codex 的 `CODEX_THREAD_ID` 只存在于 shell 环境）。`cwd` 是唯一由调用方稳定提供、且语义上对应"一个项目"的维度。
 
 ## 跨重启
 
@@ -219,7 +233,7 @@ mkdir -p ~/.dsh/skills && cp -R skills/delegate-to-codex ~/.dsh/skills/
 node --test "test/*.test.mjs"
 ```
 
-53 项：握手与版本协商、通知处理、工具清单、未知方法与未知工具、参数校验、元数据列表不含消息内容、派发调用形状、拒绝与错误透出、结果读取的时间基线、未派发会话的拒绝、长轮询（文本晚到即返回 / 超时 / 调用方取消）、真实 HTTP 往返（含 404/405/202 与 bearer 分支）、`codex exec` 事件解析、二进制解析、成功/失败/超时三种运行结果、resume 的参数分叉、工具结果的 lossless JSON 约束、**只回最终回答**（多步叙述被丢弃）、`dsh_wait` 的任一完成 / 超时 / 错误 / 未派发四种状态、`dsh_spawn` 立即返回与注册、`fork_turns=all` 走 fork、并发上限与 `dsh_close` 释放名额、`dsh_followup` 的重基线与最终回答切换、注册表落盘与重启后复原、冷会话下的缓存回答与 `offline` 状态、注册表 200 条上限的淘汰顺序、`maxHops` 拒绝回派而放行首层、在飞链路阻塞嵌套派发、速率突发的拒绝与窗口过期、followup 计入同一预算、握手版本号取自 `package.json`（不再硬编码）、阻塞式 `dsh_task` 不占 spawn 名额（重启后也不占）。
+55 项：握手与版本协商、通知处理、工具清单、未知方法与未知工具、参数校验、元数据列表不含消息内容、派发调用形状、拒绝与错误透出、结果读取的时间基线、未派发会话的拒绝、长轮询（文本晚到即返回 / 超时 / 调用方取消）、真实 HTTP 往返（含 404/405/202 与 bearer 分支）、`codex exec` 事件解析、二进制解析、成功/失败/超时三种运行结果、resume 的参数分叉、工具结果的 lossless JSON 约束、**只回最终回答**（多步叙述被丢弃）、`dsh_wait` 的任一完成 / 超时 / 错误 / 未派发四种状态、`dsh_spawn` 立即返回与注册、`fork_turns=all` 走 fork、并发上限与 `dsh_close` 释放名额、`dsh_followup` 的重基线与最终回答切换、注册表落盘与重启后复原、冷会话下的缓存回答与 `offline` 状态、注册表 200 条上限的淘汰顺序、`maxHops` 拒绝回派而放行首层、在飞链路阻塞嵌套派发、速率突发的拒绝与窗口过期、followup 计入同一预算、握手版本号取自 `package.json`（不再硬编码）、阻塞式 `dsh_task` 不占 spawn 名额（重启后也不占）、按 `cwd` 分桶的每项目预算与全局上限、过期记录到期释放名额。
 `test/persistence.test.mjs` 单独覆盖持久化：文件权限 0600、缺失/损坏/畸形记录、spawn 返回时文件已落盘、完成即缓存、followup 清缓存、close 后重启仍为 closed、冷会话走缓存或 `offline`、并发写不串。
 
 ---

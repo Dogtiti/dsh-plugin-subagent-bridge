@@ -66,7 +66,9 @@ const DEFAULTS = {
   codexTimeoutMs: 300000,
   taskTimeoutSeconds: 300,
   waitTimeoutMs: 30000,
-  maxWorkers: 4,
+  maxWorkers: 12,
+  maxWorkersPerRoot: 4,
+  workerTtlMs: 24 * 60 * 60 * 1000,
   maxHops: 1,
   dispatchPerMinute: 10,
   dispatchWindowMs: 60000,
@@ -590,9 +592,10 @@ export function createApi(ctx, state, settings) {
       const service = controller()
       if (service === undefined || service === null) throw new Error('session controller is unavailable')
       if (state.workers.has(taskName)) throw new Error(`task_name ${JSON.stringify(taskName)} is already in use`)
+      const root = typeof cwd === 'string' && cwd !== '' ? cwd : forkTurns === 'all' ? `fork:${String(from)}` : '(default)'
       guardDepth(state, settings, 0, 'dsh_spawn')
       takeDispatchSlot(state, settings)
-      assertCapacity(state, settings)
+      assertCapacity(state, settings, root)
 
       let sessionId
       if (forkTurns === 'all') {
@@ -617,7 +620,15 @@ export function createApi(ctx, state, settings) {
       )
       state.dispatched.add(sessionId)
       state.baseline.set(sessionId, before)
-      state.workers.set(taskName, { taskName, sessionId, status: 'open', countsTowardLimit: true, createdAt: Date.now(), updatedAt: Date.now() })
+      state.workers.set(taskName, {
+        taskName,
+        sessionId,
+        status: 'open',
+        countsTowardLimit: true,
+        root,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      })
       await saveWorkers(settings, state)
       return { task_name: taskName, sessionId, accepted: accepted?.accepted === true, fork_turns: forkTurns }
     },
@@ -660,7 +671,7 @@ export function createApi(ctx, state, settings) {
       for (const record of state.workers.values()) {
         const status = record.status === 'closed' ? 'closed' : workerStatus(ctx, record.sessionId, state, settings)
         if (record.status !== 'closed') await rememberOutcome(settings, state, record.sessionId, status)
-        rows.push({ task_name: record.taskName, sessionId: record.sessionId, status })
+        rows.push({ task_name: record.taskName, sessionId: record.sessionId, root: record.root ?? '(default)', status })
       }
       return rows
     },
@@ -703,6 +714,7 @@ export function createApi(ctx, state, settings) {
           sessionId: targetId,
           status: 'open',
           countsTowardLimit: false,
+          root: typeof cwd === 'string' && cwd !== '' ? cwd : '(default)',
           createdAt: Date.now(),
           updatedAt: Date.now(),
         })
@@ -990,6 +1002,7 @@ export async function loadWorkers(settings, state) {
       status: entry.status === 'closed' ? 'closed' : 'open',
       /* Blocking tasks resume as non-counting records, exactly as they were written. */
       countsTowardLimit: entry.countsTowardLimit !== false,
+      ...(typeof entry.root === 'string' ? { root: entry.root } : {}),
       createdAt: Number(entry.createdAt ?? Date.now()),
       updatedAt: Number(entry.updatedAt ?? Date.now()),
       ...(entry.outcome === undefined ? {} : { outcome: entry.outcome }),
@@ -1073,16 +1086,26 @@ function resolveWorker(state, reference) {
  * @param state - worker bookkeeping.
  * @param settings - resolved settings.
  */
-function assertCapacity(state, settings) {
-  let open = 0
+function assertCapacity(state, settings, root) {
+  const now = Date.now()
+  let total = 0
+  let inRoot = 0
   for (const record of state.workers.values()) {
     if (record.status === 'closed') continue
     if (record.countsTowardLimit === false) continue
-    open += 1
+    /* A record nobody has touched for a whole TTL stops holding a slot. */
+    if (now - Number(record.updatedAt ?? record.createdAt ?? 0) > settings.workerTtlMs) continue
+    total += 1
+    if (record.root === root) inRoot += 1
   }
-  if (open >= settings.maxWorkers) {
+  if (inRoot >= settings.maxWorkersPerRoot) {
     throw new Error(
-      `worker limit reached (${settings.maxWorkers}); close one with dsh_close before spawning another`,
+      `worker limit reached for ${root} (${settings.maxWorkersPerRoot}); close one with dsh_close before spawning another`,
+    )
+  }
+  if (total >= settings.maxWorkers) {
+    throw new Error(
+      `global worker limit reached (${settings.maxWorkers}); close one with dsh_close before spawning another`,
     )
   }
 }
@@ -1566,6 +1589,14 @@ function resolveSettings(config) {
     if (key === 'dispatchWindowMs') {
       const ms = Number(value)
       if (Number.isFinite(ms) && ms > 0) merged.dispatchWindowMs = ms
+    }
+    if (key === 'maxWorkersPerRoot') {
+      const count = Number(value)
+      if (Number.isInteger(count) && count > 0) merged.maxWorkersPerRoot = count
+    }
+    if (key === 'workerTtlMs') {
+      const ms = Number(value)
+      if (Number.isFinite(ms) && ms > 0) merged.workerTtlMs = ms
     }
     if (key === 'maxWorkers') {
       const count = Number(value)
