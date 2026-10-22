@@ -787,3 +787,11 @@ test('follow-ups count against the same budget', async () => {
   await api.followup({ worker: 'f1', message: 'b' })
   await assert.rejects(() => api.followup({ worker: 'f1', message: 'c' }), /rate limit/)
 })
+
+test('the handshake reports the manifest version', async () => {
+  const { readFileSync } = await import('node:fs')
+  const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+  const { api } = apiUnderTest()
+  const reply = await handleJsonRpc({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }, api)
+  assert.equal(reply.result.serverInfo.version, manifest.version)
+})

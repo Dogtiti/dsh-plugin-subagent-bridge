@@ -13,7 +13,7 @@
  */
 
 import { spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
@@ -21,6 +21,15 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 export const name = 'subagent-bridge'
+
+/** Version advertised in the MCP handshake, read from the manifest so it cannot drift. */
+const PACKAGE_VERSION = (() => {
+  try {
+    return JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version ?? '0.0.0'
+  } catch {
+    return '0.0.0'
+  }
+})()
 
 /** MCP protocol revisions this server understands, newest first. */
 const PROTOCOL_VERSIONS = ['2025-06-18', '2025-03-26', '2024-11-05']
@@ -433,7 +442,7 @@ export async function handleJsonRpc(message, api, options = {}) {
       return ok(id, {
         protocolVersion: version,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: 'dsh-subagent-bridge', version: '0.5.0' },
+        serverInfo: { name: 'dsh-subagent-bridge', version: PACKAGE_VERSION },
       })
     }
     case 'ping':
