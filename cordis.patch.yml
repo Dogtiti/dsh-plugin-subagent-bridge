@@ -1,0 +1,5 @@
+- insert:
+    - id: subagent-bridge
+      name: 'dsh-plugin-subagent-bridge'
+      config:
+        port: 47821

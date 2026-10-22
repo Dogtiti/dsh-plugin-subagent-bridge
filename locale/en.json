@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Subagent Bridge",
+    "description": "Loopback MCP endpoint that lets another agent hand work to DeepSeek Harness sessions, with metadata-only session listing and result reads limited to dispatched sessions."
+  }
+}
