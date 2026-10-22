@@ -58,6 +58,9 @@ const DEFAULTS = {
   taskTimeoutSeconds: 300,
   waitTimeoutMs: 30000,
   maxWorkers: 4,
+  maxHops: 1,
+  dispatchPerMinute: 10,
+  dispatchWindowMs: 60000,
   workersFile: join(homedir(), '.dsh', 'bridge', 'workers.json'),
 }
 
@@ -545,6 +548,8 @@ export function createApi(ctx, state, settings) {
   state.dispatched = state.dispatched ?? new Set()
   state.baseline = state.baseline ?? new Map()
   state.workers = state.workers ?? new Map()
+  state.chain = state.chain ?? { depth: 0, active: 0, until: 0 }
+  state.recent = state.recent ?? []
   const controller = () => ctx.get('sessionController')
   const sessions = () => ctx.get('sessions')
 
@@ -576,6 +581,8 @@ export function createApi(ctx, state, settings) {
       const service = controller()
       if (service === undefined || service === null) throw new Error('session controller is unavailable')
       if (state.workers.has(taskName)) throw new Error(`task_name ${JSON.stringify(taskName)} is already in use`)
+      guardDepth(state, settings, 0, 'dsh_spawn')
+      takeDispatchSlot(state, settings)
       assertCapacity(state, settings)
 
       let sessionId
@@ -611,6 +618,7 @@ export function createApi(ctx, state, settings) {
       if (target === undefined) throw new Error(`unknown worker ${JSON.stringify(worker)}`)
       const service = controller()
       if (service === undefined || service === null) throw new Error('session controller is unavailable')
+      takeDispatchSlot(state, settings)
       const before = Number(sessions()?.get?.(target.sessionId)?.seq ?? 0)
       const requestId = randomUUID()
       const accepted = await service.prompt(
@@ -652,6 +660,8 @@ export function createApi(ctx, state, settings) {
       const service = controller()
       if (service === undefined || service === null) throw new Error('session controller is unavailable')
       const seconds = Math.min(600, Math.max(1, Number.isFinite(timeoutSeconds) ? timeoutSeconds : settings.taskTimeoutSeconds))
+      guardDepth(state, settings, 0, 'dsh_task')
+      takeDispatchSlot(state, settings)
       const started = Date.now()
 
       let targetId = sessionId
@@ -723,6 +733,8 @@ export function createApi(ctx, state, settings) {
     async dispatch({ sessionId, text, mode }) {
       const service = controller()
       if (service === undefined || service === null) throw new Error('session controller is unavailable')
+      guardDepth(state, settings, 0, 'dsh_dispatch')
+      takeDispatchSlot(state, settings)
       const before = Number(sessions()?.get?.(sessionId)?.seq ?? 0)
       const requestId = randomUUID()
       const result = await service.prompt(
@@ -757,17 +769,24 @@ export function createApi(ctx, state, settings) {
 
     async dispatchCodex(args, exec) {
       const prompt = requireString(args?.prompt, 'prompt')
+      const depth = guardDepth(state, settings, callerDepth(state, exec?.agent?.id), 'codex_dispatch')
+      takeDispatchSlot(state, settings)
       const cwd = await resolveCwd(ctx, args?.cwd, exec)
-      return runCodex({
+      enterChain(state, depth, settings.codexTimeoutMs + 5000)
+      try {
+        return await runCodex({
         bin: resolveCodex(settings.codexBin),
         prompt,
         cwd,
         resume: typeof args?.resume === 'string' && args.resume !== '' ? args.resume : undefined,
         sandbox: typeof args?.sandbox === 'string' ? args.sandbox : settings.codexSandbox,
         timeoutMs: settings.codexTimeoutMs,
-        signal: exec?.signal,
-        children: state.children,
-      })
+          signal: exec?.signal,
+          children: state.children,
+        })
+      } finally {
+        leaveChain(state)
+      }
     },
   }
 }
@@ -845,6 +864,91 @@ function collectAssistant(ctx, sessionId, sinceSeq, settings) {
     text: joined.length > settings.maxResultChars ? joined.slice(-settings.maxResultChars) : joined,
     truncated: joined.length > settings.maxResultChars,
   }
+}
+
+
+/** Deepest cross-tool delegation currently in flight, or 0 when no chain is open. */
+export function ambientDepth(state) {
+  const chain = state.chain
+  if (chain === undefined || chain.active <= 0) return 0
+  return Date.now() < chain.until ? chain.depth : 0
+}
+
+/**
+ * Mark one outbound delegation as in flight, so anything it triggers inherits its depth.
+ * @param state - bridge bookkeeping.
+ * @param depth - depth of the run that is starting.
+ * @param ttlMs - how long the run may last.
+ */
+export function enterChain(state, depth, ttlMs) {
+  const chain = state.chain
+  chain.active += 1
+  chain.depth = Math.max(chain.depth, depth)
+  chain.until = Date.now() + ttlMs
+}
+
+/**
+ * Release one outbound delegation, closing the chain when the last one ends.
+ * @param state - bridge bookkeeping.
+ */
+export function leaveChain(state) {
+  const chain = state.chain
+  chain.active = Math.max(0, chain.active - 1)
+  if (chain.active === 0) {
+    chain.depth = 0
+    chain.until = 0
+  }
+}
+
+/**
+ * Refuse a delegation that would exceed the configured depth.
+ * @param state - bridge bookkeeping.
+ * @param settings - resolved settings.
+ * @param callerDepth - depth of the caller, when it is known to be a worker.
+ * @param action - tool name used in the message.
+ * @returns the depth this delegation would create.
+ */
+function guardDepth(state, settings, callerDepth, action) {
+  const depth = Math.max(ambientDepth(state), callerDepth ?? 0) + 1
+  if (depth > settings.maxHops) {
+    throw new Error(
+      `${action} would create delegation depth ${String(depth)}, but maxHops is ${String(settings.maxHops)}. ` +
+        'Carry the work out directly instead of delegating again.',
+    )
+  }
+  return depth
+}
+
+/**
+ * Charge one dispatch against the rolling rate limit.
+ * @param state - bridge bookkeeping.
+ * @param settings - resolved settings.
+ */
+function takeDispatchSlot(state, settings) {
+  const now = Date.now()
+  const windowMs = settings.dispatchWindowMs
+  state.recent = state.recent.filter((time) => now - time < windowMs)
+  if (state.recent.length >= settings.dispatchPerMinute) {
+    const retrySeconds = Math.max(1, Math.ceil((windowMs - (now - state.recent[0])) / 1000))
+    throw new Error(
+      `rate limit: ${String(settings.dispatchPerMinute)} dispatches per ${String(Math.round(windowMs / 1000))}s reached; retry in ${String(retrySeconds)}s`,
+    )
+  }
+  state.recent.push(now)
+}
+
+/**
+ * Depth of a session the bridge already knows: workers start one level down.
+ * @param state - bridge bookkeeping.
+ * @param sessionId - calling session, when known.
+ * @returns 1 for a bridge worker, otherwise 0.
+ */
+function callerDepth(state, sessionId) {
+  if (typeof sessionId !== 'string' || sessionId === '') return 0
+  for (const record of state.workers.values()) {
+    if (record.sessionId === sessionId) return 1
+  }
+  return 0
 }
 
 
@@ -1427,6 +1531,18 @@ function resolveSettings(config) {
     if (key === 'codexBin' && typeof value === 'string' && value !== '') merged.codexBin = value
     if (key === 'codexSandbox' && typeof value === 'string' && value !== '') merged.codexSandbox = value
     if (key === 'workersFile' && typeof value === 'string' && value !== '') merged.workersFile = expandHome(value)
+    if (key === 'maxHops') {
+      const hops = Number(value)
+      if (Number.isInteger(hops) && hops >= 0) merged.maxHops = hops
+    }
+    if (key === 'dispatchPerMinute') {
+      const count = Number(value)
+      if (Number.isInteger(count) && count > 0) merged.dispatchPerMinute = count
+    }
+    if (key === 'dispatchWindowMs') {
+      const ms = Number(value)
+      if (Number.isFinite(ms) && ms > 0) merged.dispatchWindowMs = ms
+    }
     if (key === 'maxWorkers') {
       const count = Number(value)
       if (Number.isInteger(count) && count > 0) merged.maxWorkers = count

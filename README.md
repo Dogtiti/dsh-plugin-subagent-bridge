@@ -108,6 +108,9 @@ codex mcp remove dsh-bridge
 | `maxResultChars` | `20000` | 单次 `dsh_read_result` 返回的最大字符数（超出保留尾部） |
 | `taskTimeoutSeconds` | `300` | `dsh_task` 等待一轮结束的默认上限（客户端可用 `timeoutSeconds` 覆盖，最大 600） |
 | `workersFile` | `~/.dsh/bridge/workers.json` | worker 注册表与重基线的落盘位置（0600） |
+| `maxHops` | `1` | 跨工具委派层数上限（1 = 只允许一层，和 Codex / DSH 的默认 `maxDepth: 1` 一致） |
+| `dispatchPerMinute` | `10` | 滚动窗口内允许的派发次数（spawn / task / dispatch / followup / codex_dispatch 合计） |
+| `dispatchWindowMs` | `60000` | 上述窗口长度 |
 | `maxWorkers` | `4` | 同时打开的 worker 上限；**已完成但未 `dsh_close` 的也占名额**（与 Codex 一致） |
 | `waitTimeoutMs` | `30000` | `dsh_wait` 的默认超时（1s ~ 1h，客户端可用 `timeoutMs` 覆盖） |
 | `readWaitSeconds` | `25` | `dsh_read_result` 的默认长轮询时长（上限 55，客户端可用 `waitSeconds` 覆盖） |
@@ -118,6 +121,30 @@ codex mcp remove dsh-bridge
 端口被占用时插件不会静默换端口：端到端文件里会写入 `error` 字段，并在宿主日志打印 `subagent-bridge: could not start on port …`。
 
 ---
+
+## 防环护栏
+
+两个 agent 都接了同一个桥时，存在真实的环路：DSH worker → `codex_dispatch` → 那次 Codex 运行也能看到 `dsh-bridge` → 又 `dsh_spawn` → …。两边**各自进程内**的深度规则都管不到这条链（Codex 的 `agent_max_depth` 只数自己的 `spawn_agent`，DSH 的 `maxDepth` 只看 `delegationDepth`，而桥建的 worker 是顶层会话，深度恒为 0）。
+
+所以桥自带两道：
+
+**① 深度（`maxHops`，默认 1）**
+
+- 每次都计算这次派发会产生的深度：`max(当前在飞的链路深度, 调用方深度) + 1`；
+- 调用方是桥建的 worker 时按其深度 1 起算；
+- `codex_dispatch` 运行期间会把链路标记为"在飞"，嵌套回来的调用继承该深度；
+- 超限直接报错，措辞可执行：
+  `codex_dispatch would create delegation depth 2, but maxHops is 1. Carry the work out directly instead of delegating again.`
+
+默认 1 的含义：**Codex 可以派给 DSH，但 DSH 不能再用桥派回去** —— 与两个产品各自的 `maxDepth: 1` 语义对齐。
+
+**② 速率（`dispatchPerMinute`，默认 10 / 60s）**
+
+拦截广度型失控（一次开很多 worker）和客户端紧循环重试，与提示词无关，是纯兜底：
+
+```
+rate limit: 10 dispatches per 60s reached; retry in 23s
+```
 
 ## 跨重启
 
@@ -192,7 +219,7 @@ mkdir -p ~/.dsh/skills && cp -R skills/delegate-to-codex ~/.dsh/skills/
 node --test "test/*.test.mjs"
 ```
 
-45 项：握手与版本协商、通知处理、工具清单、未知方法与未知工具、参数校验、元数据列表不含消息内容、派发调用形状、拒绝与错误透出、结果读取的时间基线、未派发会话的拒绝、长轮询（文本晚到即返回 / 超时 / 调用方取消）、真实 HTTP 往返（含 404/405/202 与 bearer 分支）、`codex exec` 事件解析、二进制解析、成功/失败/超时三种运行结果、resume 的参数分叉、工具结果的 lossless JSON 约束、**只回最终回答**（多步叙述被丢弃）、`dsh_wait` 的任一完成 / 超时 / 错误 / 未派发四种状态、`dsh_spawn` 立即返回与注册、`fork_turns=all` 走 fork、并发上限与 `dsh_close` 释放名额、`dsh_followup` 的重基线与最终回答切换、注册表落盘与重启后复原、冷会话下的缓存回答与 `offline` 状态、注册表 200 条上限的淘汰顺序。
+50 项：握手与版本协商、通知处理、工具清单、未知方法与未知工具、参数校验、元数据列表不含消息内容、派发调用形状、拒绝与错误透出、结果读取的时间基线、未派发会话的拒绝、长轮询（文本晚到即返回 / 超时 / 调用方取消）、真实 HTTP 往返（含 404/405/202 与 bearer 分支）、`codex exec` 事件解析、二进制解析、成功/失败/超时三种运行结果、resume 的参数分叉、工具结果的 lossless JSON 约束、**只回最终回答**（多步叙述被丢弃）、`dsh_wait` 的任一完成 / 超时 / 错误 / 未派发四种状态、`dsh_spawn` 立即返回与注册、`fork_turns=all` 走 fork、并发上限与 `dsh_close` 释放名额、`dsh_followup` 的重基线与最终回答切换、注册表落盘与重启后复原、冷会话下的缓存回答与 `offline` 状态、注册表 200 条上限的淘汰顺序、`maxHops` 拒绝回派而放行首层、在飞链路阻塞嵌套派发、速率突发的拒绝与窗口过期、followup 计入同一预算。
 `test/persistence.test.mjs` 单独覆盖持久化：文件权限 0600、缺失/损坏/畸形记录、spawn 返回时文件已落盘、完成即缓存、followup 清缓存、close 后重启仍为 closed、冷会话走缓存或 `offline`、并发写不串。
 
 ---

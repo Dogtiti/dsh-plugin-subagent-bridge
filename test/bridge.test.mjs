@@ -586,8 +586,16 @@ function workerHost(options = {}) {
       return undefined
     },
   }
-  const api = createApi(ctx, { dispatched: new Set() }, { maxResultChars: 1000, maxWorkers: options.maxWorkers ?? 4 })
-  return { api, calls, sessions }
+  const api = createApi(ctx, { dispatched: new Set() }, {
+    maxResultChars: 1000,
+    maxWorkers: options.maxWorkers ?? 4,
+    maxHops: options.maxHops ?? 1,
+    dispatchPerMinute: options.dispatchPerMinute ?? 1000,
+    dispatchWindowMs: options.dispatchWindowMs ?? 60000,
+    codexBin: '/definitely/not/here/codex',
+    codexTimeoutMs: 5000,
+  })
+  return { api, calls, sessions, ctx }
 }
 
 test('dsh_spawn returns immediately and registers the worker', async () => {
@@ -726,4 +734,56 @@ test('the persisted registry drops the oldest closed workers first', async () =>
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
+})
+
+test('maxHops 1 allows the first cross-tool delegation but not a return hop', async () => {
+  const { api } = workerHost()
+  await api.spawn({ taskName: 'first', message: 'a', forkTurns: 'none' })
+
+  /* A bridge worker trying to delegate back would be depth 2. */
+  const workerSession = (await api.listWorkers())[0].sessionId
+  await assert.rejects(
+    () => api.dispatchCodex({ prompt: '回去问问' }, { agent: { id: workerSession } }),
+    /delegation depth 2, but maxHops is 1/,
+  )
+
+  /* A user session (not a worker) may still delegate one level. */
+  const result = await api.dispatchCodex({ prompt: 'x', cwd: '/tmp' }, { agent: { id: 'session-user' } })
+  assert.equal(typeof result.ok, 'boolean')
+})
+
+test('an in-flight outbound run blocks nested inbound delegations', async () => {
+  const { ctx } = workerHost()
+  const { enterChain, leaveChain } = await import('../index.js')
+  const state = { dispatched: new Set(), baseline: new Map(), workers: new Map(), chain: { depth: 0, active: 0, until: 0 }, recent: [] }
+  const nested = createApi(ctx, state, { maxResultChars: 1000, maxHops: 1, dispatchPerMinute: 1000, dispatchWindowMs: 60000 })
+
+  enterChain(state, 1, 5000)
+  await assert.rejects(() => nested.spawn({ taskName: 'nested', message: 'a', forkTurns: 'none' }), /delegation depth 2/)
+  leaveChain(state)
+  const ok = await nested.spawn({ taskName: 'after', message: 'a', forkTurns: 'none' })
+  assert.equal(ok.task_name, 'after')
+})
+
+test('the rolling rate limit refuses the burst and mentions the retry window', async () => {
+  const { api } = workerHost({ dispatchPerMinute: 2 })
+  await api.spawn({ taskName: 'r1', message: 'a', forkTurns: 'none' })
+  await api.spawn({ taskName: 'r2', message: 'b', forkTurns: 'none' })
+  await assert.rejects(() => api.spawn({ taskName: 'r3', message: 'c', forkTurns: 'none' }), /rate limit: 2 dispatches per 60s reached; retry in \d+s/)
+})
+
+test('the rate window expires', async () => {
+  const { api } = workerHost({ dispatchPerMinute: 1, dispatchWindowMs: 300 })
+  await api.spawn({ taskName: 'e1', message: 'a', forkTurns: 'none' })
+  await assert.rejects(() => api.spawn({ taskName: 'e2', message: 'b', forkTurns: 'none' }), /rate limit/)
+  await new Promise((resolve) => setTimeout(resolve, 350))
+  const ok = await api.spawn({ taskName: 'e2', message: 'b', forkTurns: 'none' })
+  assert.equal(ok.task_name, 'e2')
+})
+
+test('follow-ups count against the same budget', async () => {
+  const { api } = workerHost({ dispatchPerMinute: 2 })
+  await api.spawn({ taskName: 'f1', message: 'a', forkTurns: 'none' })
+  await api.followup({ worker: 'f1', message: 'b' })
+  await assert.rejects(() => api.followup({ worker: 'f1', message: 'c' }), /rate limit/)
 })
