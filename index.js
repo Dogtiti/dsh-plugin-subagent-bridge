@@ -988,6 +988,8 @@ export async function loadWorkers(settings, state) {
       taskName: entry.taskName,
       sessionId: entry.sessionId,
       status: entry.status === 'closed' ? 'closed' : 'open',
+      /* Blocking tasks resume as non-counting records, exactly as they were written. */
+      countsTowardLimit: entry.countsTowardLimit !== false,
       createdAt: Number(entry.createdAt ?? Date.now()),
       updatedAt: Number(entry.updatedAt ?? Date.now()),
       ...(entry.outcome === undefined ? {} : { outcome: entry.outcome }),

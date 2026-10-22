@@ -208,3 +208,23 @@ test('concurrent saves serialize into one parseable document', async () => {
     assert.equal(parsed.workers.length, 20)
   })
 })
+
+test('a blocking task does not regain a spawn slot after a reload', async () => {
+  await withDir(async ({ file }) => {
+    const settings = { workersFile: file, maxResultChars: 1000, maxWorkers: 1, dispatchPerMinute: 1000, maxHops: 1 }
+    const { ctx } = liveHost()
+    const state = emptyState()
+    const api = createApi(ctx, state, settings)
+    await api.task({ prompt: '一次阻塞任务', timeoutSeconds: 5 })
+
+    const restored = emptyState()
+    await loadWorkers(settings, restored)
+    const taskRecord = [...restored.workers.values()][0]
+    assert.equal(taskRecord.countsTowardLimit, false)
+
+    /* One spawn slot is still free even though the task record is open. */
+    const reopened = createApi(ctx, restored, settings)
+    const spawned = await reopened.spawn({ taskName: 's1', message: 'a', forkTurns: 'none' })
+    assert.equal(spawned.task_name, 's1')
+  })
+})
