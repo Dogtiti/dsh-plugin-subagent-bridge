@@ -543,6 +543,7 @@ test('dsh_wait marks sessions this bridge never dispatched and reports errors', 
 function workerHost(options = {}) {
   const calls = { create: [], fork: [], prompt: [] }
   const sessions = new Map()
+  const listeners = new Set()
   let counter = 0
   const make = (id) => {
     const session = { id, seq: 0, snapshotEvents: () => session.events, events: [] }
@@ -550,7 +551,10 @@ function workerHost(options = {}) {
     return session
   }
   const ctx = {
-    on: () => () => {},
+    on(name, listener) {
+      if (name === 'session/event') listeners.add(listener)
+      return () => listeners.delete(listener)
+    },
     get(name) {
       if (name === 'sessions') return { get: (id) => sessions.get(id) }
       if (name === 'agents') return { get: () => ({ status: 'idle' }) }
@@ -579,6 +583,9 @@ function workerHost(options = {}) {
             session.events.push({ seq: base + 2, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: `第${String(turn)}轮结果` }] } } })
             session.events.push({ seq: base + 3, type: 'turn/end', data: { turn, reason: { kind: 'completed' } } })
             session.seq = base + 3
+            for (const listener of listeners) {
+              listener(session, { type: 'turn/end', data: { turn, reason: { kind: 'completed' } } })
+            }
             return { accepted: true }
           },
         }
@@ -794,4 +801,17 @@ test('the handshake reports the manifest version', async () => {
   const { api } = apiUnderTest()
   const reply = await handleJsonRpc({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }, api)
   assert.equal(reply.result.serverInfo.version, manifest.version)
+})
+
+test('blocking tasks do not consume the spawn budget', async () => {
+  const { api } = workerHost({ maxWorkers: 2 })
+  for (const name of ['t1', 't2', 't3']) {
+    const result = await api.task({ prompt: name, timeoutSeconds: 5 })
+    assert.equal(result.status, 'completed')
+  }
+  const spawned = await api.spawn({ taskName: 's1', message: 'a', forkTurns: 'none' })
+  assert.equal(spawned.task_name, 's1')
+  /* Two spawned workers still hit the limit. */
+  await api.spawn({ taskName: 's2', message: 'b', forkTurns: 'none' })
+  await assert.rejects(() => api.spawn({ taskName: 's3', message: 'c', forkTurns: 'none' }), /worker limit reached/)
 })

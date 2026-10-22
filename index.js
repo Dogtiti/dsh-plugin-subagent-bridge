@@ -617,7 +617,7 @@ export function createApi(ctx, state, settings) {
       )
       state.dispatched.add(sessionId)
       state.baseline.set(sessionId, before)
-      state.workers.set(taskName, { taskName, sessionId, status: 'open', createdAt: Date.now(), updatedAt: Date.now() })
+      state.workers.set(taskName, { taskName, sessionId, status: 'open', countsTowardLimit: true, createdAt: Date.now(), updatedAt: Date.now() })
       await saveWorkers(settings, state)
       return { task_name: taskName, sessionId, accepted: accepted?.accepted === true, fork_turns: forkTurns }
     },
@@ -694,9 +694,18 @@ export function createApi(ctx, state, settings) {
       )
       state.dispatched.add(targetId)
       state.baseline.set(targetId, before)
-      const implicitName = `worker_${targetId.slice('session-'.length, 'session-'.length + 8)}`
+      /* A blocking task is not a spawned worker: it is recorded for later lookup but
+       * must not consume one of the concurrency slots. */
+      const implicitName = `task_${targetId.slice('session-'.length, 'session-'.length + 8)}`
       if (!state.workers.has(implicitName)) {
-        state.workers.set(implicitName, { taskName: implicitName, sessionId: targetId, status: 'open', createdAt: Date.now(), updatedAt: Date.now() })
+        state.workers.set(implicitName, {
+          taskName: implicitName,
+          sessionId: targetId,
+          status: 'open',
+          countsTowardLimit: false,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        })
         await saveWorkers(settings, state)
       }
 
@@ -1064,7 +1073,11 @@ function resolveWorker(state, reference) {
  */
 function assertCapacity(state, settings) {
   let open = 0
-  for (const record of state.workers.values()) if (record.status !== 'closed') open += 1
+  for (const record of state.workers.values()) {
+    if (record.status === 'closed') continue
+    if (record.countsTowardLimit === false) continue
+    open += 1
+  }
   if (open >= settings.maxWorkers) {
     throw new Error(
       `worker limit reached (${settings.maxWorkers}); close one with dsh_close before spawning another`,

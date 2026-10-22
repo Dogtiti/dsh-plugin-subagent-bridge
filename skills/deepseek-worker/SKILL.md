@@ -9,7 +9,7 @@ DSH 是通过 `dsh-bridge` MCP 接上来的另一个编码代理。用法和"给
 
 ## 先确认工具在
 
-工具列表里应当有 `dsh_task`、`dsh_dispatch`、`dsh_read_result`、`dsh_list_sessions`。
+工具列表里应当有：`dsh_task`、`dsh_spawn`、`dsh_wait`、`dsh_followup`、`dsh_close`、`dsh_list_workers`、`dsh_dispatch`、`dsh_read_result`、`dsh_list_sessions`。
 
 - 没有 `dsh_task` → DSH 没启动或 MCP 未接入。直接告诉用户"需要先启动 DeepSeek Harness"，**不要假装调用成功**。
 - 调用报连接错误 → 报错误原文，然后自己把这件事做掉，不要反复重试。
@@ -37,6 +37,52 @@ dsh_task({
 ```
 
 `dsh_task` **阻塞到 DSH 那一轮结束**再返回，不需要轮询。默认最多等 300 秒，更重的任务传 `timeoutSeconds`（上限 600）。
+
+## 多件活：并行开 worker
+
+互不依赖的子任务，**并行比串行快**，而且往往质量更好（每个 worker 有干净的上下文）。这是 Codex 自己多智能体策略的原话，照抄过来：
+
+> 只要并行能省时间或提高质量，就应该把任务分出去（无论你是主 agent 还是子 agent）。
+
+流程：
+
+```jsonc
+// 1. 一次开多个，每个都立刻返回，不等结果
+dsh_spawn({ "task_name": "audit_api",   "message": "审 src/api/**，只出问题清单" })
+dsh_spawn({ "task_name": "audit_store", "message": "审 src/store/**，只出问题清单" })
+dsh_spawn({ "task_name": "run_tests",   "message": "跑全量测试，只报失败用例" })
+
+// 2. 等任意一个先完成（谁先好先用，不必等全部）
+dsh_wait({ "targets": ["audit_api", "audit_store", "run_tests"], "timeoutMs": 300000 })
+// → { "status": { "audit_api": { "completed": "…" }, "audit_store": "running", … } }
+
+// 3. 处理已完成的，继续等剩下的；完工的记得关掉
+dsh_close({ "worker": "audit_api" })
+```
+
+**规则（与 Codex 一致）**
+
+- **并发上限 4 个 worker**（`maxWorkers`）。**已完成但没 `dsh_close` 的也占名额** —— 用完就关，别一直挂着。
+- `dsh_task` 是阻塞的、一次一件；它**不占**那 4 个名额，适合"我就等着这一件"。
+- `dsh_wait` 给**长一点的超时**（默认 30 秒偏短，重活用 2~5 分钟），不要用短超时反复轮询 —— Codex 的原话是 "prefer longer waits (minutes) to avoid busy polling"。
+- `dsh_wait` 只要**任意一个**到终态就返回，所以它是"收割完成项"的循环，而不是"等全部"。
+
+**不要并行的情况**
+
+- 任务之间**有先后依赖**（B 要用 A 的结论）。
+- 多个 worker 要改**同一批文件**：它们各自在自己的会话里，但落在同一个仓库，并发改同一文件会互相覆盖。要并行就按目录/模块切分，并在 prompt 里写死各自的边界。
+- 你还没想清楚验收标准 —— 先想清楚再拆，否则只是把混乱放大 4 倍。
+
+**需要上下文时**
+
+```jsonc
+dsh_spawn({ "task_name": "continue_here", "fork_turns": "all",
+            "from": "session-…",            // 既有 DSH 会话
+            "message": "接着这个会话继续修那个失败用例" })
+```
+
+`fork_turns: "all"` 会 fork 那个会话作为 worker 的起点（继承到最近一个已完成 turn），worker 的后续改动**不会**污染原会话。默认 `"none"` 是全新空会话。
+
 
 ## 怎么写 prompt
 
@@ -77,10 +123,18 @@ worker 收到的是**一条普通用户消息**，它看不到你这边有没有
 ## 同一个 worker 继续干
 
 ```jsonc
-dsh_task({ "sessionId": "session-…", "prompt": "再把失败的那个用例补上" })
+dsh_followup({ "worker": "audit_api", "message": "把第 3 条展开，给出补丁" })
 ```
 
-适合"先改、看了再补"的往返。目标会话正在跑时会被拒绝（提示改用 `dsh_dispatch`），这是有意的。
+`dsh_followup` 复用该 worker 的会话，比新开一个便宜。也可以用 `dsh_task({ "sessionId": …, "prompt": … })` 做同样的事（阻塞版）。
+
+## 查现在有哪些 worker
+
+```jsonc
+dsh_list_workers()   // [{ task_name, sessionId, status }, …]
+```
+
+`status` 是 `"running"` / `"pending"` / `{completed}` / `{errored}` / `"closed"` / `"offline"`（重启后会话没打开且无缓存结果）。**重启 App 之后这些记录仍在**（落在 `~/.dsh/bridge/workers.json`）。
 
 ## 低阶工具（一般不用）
 
@@ -94,5 +148,6 @@ dsh_task({ "sessionId": "session-…", "prompt": "再把失败的那个用例补
 
 - 不要把密钥、私有凭据写进 `prompt`——它会进入 DSH 的会话日志。
 - 不要让 worker 操作你的本地环境（它有自己的权限与目录）。
-- 不要把三件不相关的事塞进一次调用；拆开更可控。
+- 不要把三件不相关的事塞进一次调用；拆开更可控（也可以直接并行）。
+- 不要超过 4 个 worker，也不要让已完成的 worker 一直挂着不关。
 - 不要在 DSH 未启动时假装委派成功。
