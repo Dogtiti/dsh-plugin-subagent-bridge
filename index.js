@@ -612,6 +612,7 @@ export function createApi(ctx, state, settings) {
       } else {
         const opened = await service.create(cwd === undefined ? {} : { cwd })
         sessionId = opened?.sessionId
+        if (typeof sessionId === 'string' && sessionId !== '') await attachToWorkspace(ctx, sessionId, cwd ?? undefined)
         if (typeof sessionId !== 'string' || sessionId === '') throw new Error('session controller did not return a session id')
       }
 
@@ -695,6 +696,7 @@ export function createApi(ctx, state, settings) {
       if (targetId === undefined) {
         const opened = await service.create(cwd === undefined ? {} : { cwd })
         targetId = opened?.sessionId
+        if (typeof targetId === 'string' && targetId !== '') await attachToWorkspace(ctx, targetId, cwd ?? undefined)
         if (typeof targetId !== 'string' || targetId === '') throw new Error('session controller did not return a session id')
         created = true
       } else if (ctx.get('agents')?.get?.(targetId)?.status === 'running') {
@@ -1009,6 +1011,26 @@ function callerDepth(state, sessionId) {
     if (record.sessionId === sessionId) return 1
   }
   return 0
+}
+
+
+/**
+ * Place a freshly created session in the workspace its directory belongs to.
+ * `sessionController.create` only records a working directory; the sidebar groups
+ * live in a separate registry, so without this step a worker shows up as ungrouped.
+ * @param ctx - Host context.
+ * @param sessionId - session just created.
+ * @param cwd - directory the session was opened in.
+ */
+async function attachToWorkspace(ctx, sessionId, cwd) {
+  if (typeof cwd !== 'string' || cwd === '') return
+  try {
+    const registry = ctx.get('workspaceRegistry')
+    const workspace = await registry?.resolveByPath?.(cwd)
+    await workspace?.attachSession?.(sessionId)
+  } catch {
+    /* Grouping is cosmetic: a failure here must not fail the dispatch. */
+  }
 }
 
 

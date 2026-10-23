@@ -883,3 +883,26 @@ test('blocking durations stay under the MCP client timeout', async () => {
   const task = await api.task({ prompt: 'x', timeoutSeconds: 3600 })
   assert.equal(task.status, 'completed')
 })
+
+test('a spawned worker is attached to the workspace its directory belongs to', async () => {
+  const attached = []
+  const host = workerHost()
+  const workspace = { id: 'ws-clawer', attachSession: async (id) => { attached.push(id) } }
+  const ctx = {
+    ...host.ctx,
+    get(name) {
+      if (name === 'workspaceRegistry') {
+        return { resolveByPath: async (path) => (path === '/repo/clawer' ? workspace : undefined) }
+      }
+      return host.ctx.get(name)
+    },
+  }
+  const api = createApi(ctx, { dispatched: new Set() }, { maxResultChars: 1000, maxWorkers: 4, maxHops: 1, dispatchPerMinute: 100 })
+  const spawned = await api.spawn({ taskName: 'w', message: 'a', forkTurns: 'none', cwd: '/repo/clawer' })
+  assert.deepEqual(attached, [spawned.sessionId])
+
+  /* A directory outside every workspace stays ungrouped instead of throwing. */
+  const outside = await api.spawn({ taskName: 'w2', message: 'b', forkTurns: 'none', cwd: '/elsewhere' })
+  assert.equal(attached.length, 1)
+  assert.ok(outside.sessionId)
+})
