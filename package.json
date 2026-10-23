@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-subagent-bridge",
-  "version": "0.7.3",
+  "version": "0.7.4",
   "type": "module",
   "description": "Subagent bridge: lets Codex delegate a task to DeepSeek Harness the way it would spawn a subagent (one call, waits for the answer), plus a codex_dispatch tool for the reverse direction.",
   "keywords": [

@@ -104,6 +104,23 @@ dsh_spawn({ "task_name": "continue_here", "fork_turns": "all",
 `fork_turns: "all"` 会 fork 那个会话作为 worker 的起点（继承到最近一个已完成 turn），worker 的后续改动**不会**污染原会话。默认 `"none"` 是全新空会话。
 
 
+## 让它自己并行（DSH 也有 subagent）
+
+DSH **自带** `subagent` 工具（和这座桥无关，是它自己的能力，worker 在深度 0，可以开子 agent）。但它**默认不会用**——不提示就一个人串行干完。
+
+任务能拆成互不依赖的几块时，在 prompt 末尾加一句：
+
+> 这几块互不依赖，可以用你自己的 subagent 并行处理，最后汇总。
+
+实测：4 个互不依赖的乘法 + 这句提示 → 它开了 **4 个 subagent 并行**，43 秒返回汇总，结果全对。不加这句，同样的活它串行做完。
+
+判断标准和 Codex 的 proactive 策略一致：
+
+- ✅ 子任务互不依赖、并行能省时间或提高质量 → 加这句
+- ❌ 有先后依赖、要改同一批文件、验收标准还没想清 → 不要加，串行更稳
+
+DSH 自己的委派深度上限是 1：worker（depth 0）能开子 agent（depth 1），子 agent 不能再往下开。所以不会无限递归。
+
 ## 怎么写 prompt
 
 worker **看不到你这段对话**，它只有 `prompt` 和 `cwd`。写成可以独立开工的工单：
