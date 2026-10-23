@@ -847,3 +847,39 @@ test('each working directory gets its own budget up to the global ceiling', asyn
     /global worker limit reached \(4\)/,
   )
 })
+
+test('a timed-out task reports that the worker is still running', async () => {
+  const events = []
+  const session = { id: 'session-slow', seq: 0, snapshotEvents: () => events }
+  const ctx = {
+    on: () => () => {},
+    get(name) {
+      if (name === 'sessions') return { get: (id) => (id === 'session-slow' ? session : undefined) }
+      if (name === 'agents') return { get: () => ({ status: 'running' }) }
+      if (name === 'sessionController') {
+        return {
+          create: async () => ({ sessionId: 'session-slow' }),
+          /* Never finishes: the call has to time out. */
+          prompt: async () => ({ accepted: true }),
+        }
+      }
+      return undefined
+    },
+  }
+  const api = createApi(ctx, { dispatched: new Set() }, { maxResultChars: 1000, taskTimeoutSeconds: 1, maxHops: 1, dispatchPerMinute: 100 })
+  const result = await api.task({ prompt: '长任务' })
+  assert.equal(result.status, 'timeout')
+  assert.equal(result.running, true)
+  assert.match(result.next, /do not end the turn/)
+  assert.match(result.next, /dsh_wait/)
+})
+
+test('blocking durations stay under the MCP client timeout', async () => {
+  const { api } = workerHost()
+  /* A caller asking for an hour gets clamped, not a client-side timeout error. */
+  const waited = await api.wait({ targets: ['nobody'], timeoutMs: 3_600_000 })
+  assert.equal(waited.timedOut, false)
+  assert.equal(waited.status.nobody, 'not_found')
+  const task = await api.task({ prompt: 'x', timeoutSeconds: 3600 })
+  assert.equal(task.status, 'completed')
+})

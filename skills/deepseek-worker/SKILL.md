@@ -5,7 +5,12 @@ description: 交给 DSH / 开个 worker 时使用；把自足任务当 subagent 
 
 # 把任务交给 DSH（subagent 用法）
 
-DSH 是通过 `dsh-bridge` MCP 接上来的另一个编码代理。用法和"给自己开一个 subagent"一样：**一次调用，给它一个自足的任务，等它把这一轮干完并返回结论。**
+DSH 是通过 `dsh-bridge` MCP 接上来的另一个编码代理。用法和"给自己开一个 subagent"一样：**给它一个自足的任务，等它把这一轮干完并返回结论。**
+
+> **最重要的一条：任务没跑完，不许结束回合。**
+> Codex 原生的 subagent 会把结果**推送**回来、自动唤醒你；这个桥是**拉取**式的 —— 你结束回合，结果就没人接收了，用户只能人工来叫你回去。所以：只要还有 `running` 的 worker，就必须继续调 `dsh_wait` / `dsh_task` / `dsh_read_result`，直到全部到终态。
+
+> **单次调用最长 240 秒。** Codex 的 MCP 客户端在 **300 秒**时会把工具调用判为失败（`timed out awaiting tools/call after 300s`）。所以 `timeoutSeconds` / `timeoutMs` / `waitSeconds` 一律不要超过 240，超了也不会生效（会被夹到 240）。
 
 ## 先确认工具在
 
@@ -36,7 +41,22 @@ dsh_task({
 }
 ```
 
-`dsh_task` **阻塞到 DSH 那一轮结束**再返回，不需要轮询。默认最多等 300 秒，更重的任务传 `timeoutSeconds`（上限 600）。
+`dsh_task` **阻塞到 DSH 那一轮结束**再返回，最多等 **240 秒**（默认值，也是上限）。超时它不会假装成功，而是明确告诉你还在跑：
+
+```jsonc
+{ "status": "timeout", "running": true, "text": "",
+  "next": "the worker is still running; do not end the turn. Call dsh_wait(...) and repeat until it is not running." }
+```
+
+**看到 `running: true` 就继续等**，不要结束回合、也不要把空 `text` 当成"它没干成"。
+
+最省事的续等方式（`dsh_task` 本身会阻塞，再调一次同一个 sessionId 等价于继续等）：
+
+```jsonc
+dsh_task({ "sessionId": "session-…", "prompt": "继续", "timeoutSeconds": 240 })
+```
+
+更好的方式是不用 `dsh_task` 的续做语义，而是直接用 `dsh_wait` 等它（见下节）。
 
 ## 多件活：并行开 worker
 
@@ -64,7 +84,7 @@ dsh_close({ "worker": "audit_api" })
 
 - **并发上限 4 个 worker**（`maxWorkers`）。**已完成但没 `dsh_close` 的也占名额** —— 用完就关，别一直挂着。
 - `dsh_task` 是阻塞的、一次一件；它**不占**那 4 个名额，适合"我就等着这一件"。
-- `dsh_wait` 给**长一点的超时**（默认 30 秒偏短，重活用 2~5 分钟），不要用短超时反复轮询 —— Codex 的原话是 "prefer longer waits (minutes) to avoid busy polling"。
+- `dsh_wait` 每次给满 **240000**（毫秒）。**它返回 `timedOut: true` / 仍有 `"running"` 时，不代表结束，只代表"还没好"** —— 继续调它，直到没有任何 target 是 `running`/`pending`。短超时反复轮询是错的（Codex 原话：prefer longer waits (minutes) to avoid busy polling）。
 - `dsh_wait` 只要**任意一个**到终态就返回，所以它是"收割完成项"的循环，而不是"等全部"。
 
 **不要并行的情况**
@@ -114,11 +134,21 @@ worker 收到的是**一条普通用户消息**，它看不到你这边有没有
 
 一旦 prompt 里出现 `deepseek-worker`，worker 会以为那是它自己的技能或工具，白费一轮去确认「本会话没有这个技能」。
 
+## 收工的判断标准
+
+下面三件事同时成立，才可以结束回合：
+
+1. 所有派出去的 worker 状态都是 `{completed}` / `{errored}` / `"closed"` / `"not_found"` / `"offline"`；
+2. 没有任何 worker 是 `"running"` 或 `"pending"`；
+3. 你已经对每个完成的 worker 做过必要的复核（跑测试、看 diff）。
+
+只要还有 `running`，就继续 `dsh_wait`。**宁可多等一轮，也不要留一个没人收的 worker。**
+
 ## 拿到结果之后
 
 - `completed` → 读 `text`，判断是否真的达成交付；需要复核就自己跑一遍验证命令。
 - `turn-…`（如 `turn-aborted`、`turn-error`）→ 那一轮没正常结束，把 `text` 里的信息转述给用户，必要时自己接手。
-- `timeout` → 工作**没有丢**，DSH 那边还在跑。用同一个 `sessionId` 再调一次问进度，或先用低阶工具看一眼。
+- `timeout`（带 `running: true`）→ 工作**没有丢**，DSH 那边还在跑。**必须继续等**：`dsh_wait({targets:[…]})` 或再调一次 `dsh_task({sessionId, …})`，直到不是 running。
 
 ## 同一个 worker 继续干
 

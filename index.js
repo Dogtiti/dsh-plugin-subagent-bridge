@@ -37,6 +37,9 @@ const PROTOCOL_VERSIONS = ['2025-06-18', '2025-03-26', '2024-11-05']
 /** Largest JSON-RPC body accepted on the bridge endpoint. */
 const MAX_BODY_BYTES = 1024 * 1024
 
+/** Longest a single tool call may block: the MCP client gives up at 300s. */
+const MAX_BLOCKING_SECONDS = 240
+
 /** Worker records kept on disk; the oldest closed ones drop off first. */
 const MAX_PERSISTED_WORKERS = 200
 
@@ -60,12 +63,12 @@ const DEFAULTS = {
   port: 47821,
   endpointFile: join(homedir(), '.dsh', 'bridge', 'endpoint.json'),
   maxResultChars: MAX_RESULT_CHARS,
-  readWaitSeconds: 25,
+  readWaitSeconds: 45,
   codexBin: 'codex',
   codexSandbox: 'workspace-write',
   codexTimeoutMs: 300000,
-  taskTimeoutSeconds: 300,
-  waitTimeoutMs: 30000,
+  taskTimeoutSeconds: MAX_BLOCKING_SECONDS,
+  waitTimeoutMs: MAX_BLOCKING_SECONDS * 1000,
   maxWorkers: 12,
   maxWorkersPerRoot: 4,
   workerTtlMs: 24 * 60 * 60 * 1000,
@@ -80,7 +83,7 @@ const TOOLS = [
   {
     name: 'dsh_task',
     description:
-      'Delegate one self-contained task to DeepSeek Harness and wait for the finished answer, exactly like spawning a subagent: the bridge opens a fresh DSH session in `cwd`, delivers the task, blocks until that turn ends, and returns the answer. Use this for real work delegation; no session id is needed. The prompt is delivered verbatim as an ordinary user message in that session, so write it as a work order for a colleague: do not mention your own tools, skills, or role framing — the worker has no such skill and will only waste a turn looking for it.',
+      'Delegate one self-contained task to DeepSeek Harness and wait for the finished answer, exactly like spawning a subagent: the bridge opens a fresh DSH session in `cwd`, delivers the task, blocks up to 240 seconds, and returns the answer. A result with status "timeout" and running:true means the worker is STILL WORKING: keep the turn open and call dsh_wait or dsh_task again until it is no longer running. Never pass a timeout above 240 seconds — the MCP client aborts tool calls after 300. The prompt is delivered verbatim as an ordinary user message in that session, so write it as a work order for a colleague: do not mention your own tools, skills, or role framing — the worker has no such skill and will only waste a turn looking for it.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -100,7 +103,7 @@ const TOOLS = [
   {
     name: 'dsh_spawn',
     description:
-      'Start a worker and return immediately with its task_name, so several workers can run in parallel; collect answers with dsh_wait. Use fork_turns "all" with `from` to start the worker from a copy of an existing DSH session instead of an empty one.',
+      'Start a worker and return immediately with its task_name, so several workers can run in parallel. This tool does NOT wait and the result is never pushed back, so you must collect it in this same turn with dsh_wait (each call blocks up to 240 seconds; repeat until every target is no longer "running") before you end the turn. Use fork_turns "all" with `from` to start the worker from a copy of an existing DSH session.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -170,7 +173,7 @@ const TOOLS = [
   {
     name: 'dsh_wait',
     description:
-      'Wait until any of the given workers reaches a final state, then return per-worker status. A finished worker carries its final answer only. Prefer long waits over polling.',
+      'Wait until any of the given workers reaches a final state, then return per-worker status. A finished worker carries its final answer only. Long waits beat polling: pass timeoutMs: 240000, and when the reply still lists "running" workers, call this again instead of ending the turn.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -679,7 +682,10 @@ export function createApi(ctx, state, settings) {
     async task({ prompt, cwd, sessionId, agentPreset, timeoutSeconds }) {
       const service = controller()
       if (service === undefined || service === null) throw new Error('session controller is unavailable')
-      const seconds = Math.min(600, Math.max(1, Number.isFinite(timeoutSeconds) ? timeoutSeconds : settings.taskTimeoutSeconds))
+      const seconds = Math.min(
+        MAX_BLOCKING_SECONDS,
+        Math.max(1, Number.isFinite(timeoutSeconds) ? timeoutSeconds : settings.taskTimeoutSeconds),
+      )
       guardDepth(state, settings, 0, 'dsh_task')
       takeDispatchSlot(state, settings)
       const started = Date.now()
@@ -725,10 +731,18 @@ export function createApi(ctx, state, settings) {
       const collected = finalAnswer(ctx, targetId, before, settings)
       const turnReason = end?.reason?.kind ?? null
       const durationMs = Date.now() - started
+      const status = end === undefined ? 'timeout' : turnReason === 'completed' ? 'completed' : `turn-${String(turnReason)}`
       return {
         sessionId: targetId,
         created,
-        status: end === undefined ? 'timeout' : turnReason === 'completed' ? 'completed' : `turn-${String(turnReason)}`,
+        status,
+        /* A timeout means "still running": say so, and say what to call next. */
+        ...(status === 'timeout'
+          ? {
+              running: true,
+              next: `the worker is still running; do not end the turn. Call dsh_wait({targets:["${targetId}"],timeoutMs:${String(MAX_BLOCKING_SECONDS * 1000)}}) and repeat until it is not "running".`,
+            }
+          : {}),
         text: collected.text,
         truncated: collected.truncated,
         turns: lastTurn(ctx, targetId),
@@ -738,7 +752,10 @@ export function createApi(ctx, state, settings) {
     },
 
     async wait({ targets, timeoutMs }) {
-      const budget = Math.min(3600000, Math.max(1000, Number.isFinite(timeoutMs) ? timeoutMs : settings.waitTimeoutMs))
+      const budget = Math.min(
+        MAX_BLOCKING_SECONDS * 1000,
+        Math.max(1000, Number.isFinite(timeoutMs) ? timeoutMs : settings.waitTimeoutMs),
+      )
       const started = Date.now()
       for (;;) {
         const status = {}
@@ -755,7 +772,20 @@ export function createApi(ctx, state, settings) {
         }
         const waitedMs = Date.now() - started
         if (settled) return { status, timedOut: false, waitedMs }
-        if (waitedMs >= budget) return { status, timedOut: true, waitedMs }
+        if (waitedMs >= budget) {
+          const still = targets.filter((target) => status[target] === 'running' || status[target] === 'pending')
+          return {
+            status,
+            timedOut: true,
+            waitedMs,
+            ...(still.length === 0
+              ? {}
+              : {
+                  running: true,
+                  next: `still running: ${still.join(', ')}; call dsh_wait again with the same targets until none of them are "running"`,
+                }),
+          }
+        }
         await sleep(Math.min(300, budget - waitedMs))
       }
     },
@@ -1604,11 +1634,11 @@ function resolveSettings(config) {
     }
     if (key === 'waitTimeoutMs') {
       const ms = Number(value)
-      if (Number.isFinite(ms) && ms > 0) merged.waitTimeoutMs = Math.min(3600000, Math.max(1000, ms))
+      if (Number.isFinite(ms) && ms > 0) merged.waitTimeoutMs = Math.min(MAX_BLOCKING_SECONDS * 1000, Math.max(1000, ms))
     }
     if (key === 'taskTimeoutSeconds') {
       const seconds = Number(value)
-      if (Number.isFinite(seconds) && seconds > 0) merged.taskTimeoutSeconds = Math.min(600, seconds)
+      if (Number.isFinite(seconds) && seconds > 0) merged.taskTimeoutSeconds = Math.min(MAX_BLOCKING_SECONDS, seconds)
     }
     if (key === 'codexTimeoutMs') {
       const ms = Number(value)
