@@ -2,6 +2,8 @@
 
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![dsh](https://img.shields.io/badge/DSH-%5E0.2.1--0-2f6fed)](https://github.com/deepseek-ai/deepseek-harness)
+<!-- M8ven ownership proof — keep this line in place; it verifies the publisher. -->
+[![M8ven Score](https://m8ven.ai/badge/mcp/dogtiti-dsh-plugin-subagent-bridge-8a3t8k?v=f15f3e56c3fa22e8aafb88cf5428501f)](https://m8ven.ai/mcp/dogtiti-dsh-plugin-subagent-bridge-8a3t8k?s=readme)
 
 在 DeepSeek Harness 宿主内部提供**本机回环 MCP 端点**，让另一个智能体（如 Codex）把任务派给 DSH 会话并取回结果。
 
