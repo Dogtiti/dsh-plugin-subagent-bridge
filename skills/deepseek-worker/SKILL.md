@@ -121,6 +121,33 @@ DSH **自带** `subagent` 工具（和这座桥无关，是它自己的能力，
 
 DSH 自己的委派深度上限是 1：worker（depth 0）能开子 agent（depth 1），子 agent 不能再往下开。所以不会无限递归。
 
+## 指定 worker 用哪个模型
+
+`dsh_task`、`dsh_spawn`、`dsh_followup` 都支持 `model`。默认不传，worker 跟随会话默认模型。
+
+```json
+{ "prompt": "…", "cwd": "/repo", "model": "zai-coding-cn/glm-5.3", "reasoningEffort": "max" }
+```
+
+- 写法是 **`provider/model`**，中间一个斜杠；
+- **只写模型名**（`"glm-5.3"`）会沿用当前默认 provider——省事但容易踩空，见下；
+- `reasoningEffort` 可选，取值随模型（`low` / `medium` / `high` / `max` 等），模型不支持该档会直接报错；
+- 不传 `model` 的调用行为完全不变，不要为了"保险"而乱传。
+
+什么时候值得指定：
+
+| 场景 | 做法 |
+| --- | --- |
+| 任务要长上下文 / 大文件 | 挑窗口大的模型 |
+| 要跨模型复核同一件事 | 第二次派发换另一家的模型 |
+| 便宜模型够用（改文档、跑格式） | 显式指定小模型省钱 |
+| 用同一个 worker 干不同类型活 | `dsh_followup` 里换 `model` |
+
+**只写模型名的坑**：`glm-5.3`、`deepseek-v4.1-flash` 这类模型同时挂在多个 provider 下（`zai-coding-cn`、`opencode-go`、`newapi`…），只写名字会落到当前默认 provider 上，可能和你想的不是同一家。**要么写全 `provider/model`，要么先确认当前默认是什么。**
+
+写错了（`/glm-5.3`、`a/b/c`）桥会在**发 prompt 之前**报错，不会白跑一轮。
+
+
 ## 怎么写 prompt
 
 worker **看不到你这段对话**，它只有 `prompt` 和 `cwd`。写成可以独立开工的工单：
