@@ -11,6 +11,23 @@
 
 ---
 
+## 指定模型
+
+`dsh_task`、`dsh_spawn`、`dsh_followup` 都可以带 `model`，让 worker 跑在指定模型上：
+
+```js
+dsh_task({ prompt: "…", model: "zai-coding-cn/glm-5.3", reasoningEffort: "max" })
+dsh_spawn({ task_name: "review", message: "…", model: "opencode-go/deepseek-v4.1-flash" })
+dsh_followup({ worker: "review", message: "…", model: "deepseek-account/deepseek-flash" })
+```
+
+- 写法是 `provider/model`；**只写模型名**时沿用当前默认 provider（`model: "glm-5.3"`）；
+- `reasoningEffort` 可选，取值随模型（`low` / `medium` / `high` / `max` 等）；
+- 不传 `model` 就完全不动会话，行为和以前一致；
+- 实测（Host 侧 `sessionController.selectModel`）：请求头里的 provider/model 确实变成指定的那组，且**不会改写 profile 的默认模型**。
+
+实现上就是在建好会话、发第一个 prompt **之前**调一次 `selectModel`，所以 worker 的第一轮就已经在新模型上跑。
+
 ## 工具
 
 | 工具 | 作用 |

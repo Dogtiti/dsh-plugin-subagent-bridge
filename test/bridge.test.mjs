@@ -382,6 +382,9 @@ function taskHost(options = {}) {
     get(name) {
       if (name === 'sessions') return { get: (id) => (id === 'session-worker' ? session : undefined) }
       if (name === 'agents') return { get: () => ({ status: 'idle' }) }
+      if (name === 'agentDefaultModel') {
+        return { currentSelection: () => options.defaultSelection ?? { provider: 'opencode-go', model: 'deepseek-v4.1-flash' } }
+      }
       if (name === 'sessionController') {
         return {
           create: async (request) => {
@@ -445,6 +448,9 @@ test('dsh_task delivers only the final answer, not the whole turn', async () => 
     get(name) {
       if (name === 'sessions') return { get: (id) => (id === 'session-worker' ? session : undefined) }
       if (name === 'agents') return { get: () => ({ status: 'idle' }) }
+      if (name === 'agentDefaultModel') {
+        return { currentSelection: () => options.defaultSelection ?? { provider: 'opencode-go', model: 'deepseek-v4.1-flash' } }
+      }
       if (name === 'sessionController') {
         return {
           create: async () => ({ sessionId: 'session-worker' }),
@@ -541,7 +547,7 @@ test('dsh_wait marks sessions this bridge never dispatched and reports errors', 
  * @returns an api plus the recorded calls.
  */
 function workerHost(options = {}) {
-  const calls = { create: [], fork: [], prompt: [] }
+  const calls = { create: [], fork: [], prompt: [], selectModel: [] }
   const sessions = new Map()
   const listeners = new Set()
   let counter = 0
@@ -558,6 +564,9 @@ function workerHost(options = {}) {
     get(name) {
       if (name === 'sessions') return { get: (id) => sessions.get(id) }
       if (name === 'agents') return { get: () => ({ status: 'idle' }) }
+      if (name === 'agentDefaultModel') {
+        return { currentSelection: () => options.defaultSelection ?? { provider: 'opencode-go', model: 'deepseek-v4.1-flash' } }
+      }
       if (name === 'sessionController') {
         return {
           create: async (request) => {
@@ -573,6 +582,10 @@ function workerHost(options = {}) {
             const id = `session-fork${String(counter)}`
             make(id)
             return { sessionId: id }
+          },
+          selectModel: async (request) => {
+            calls.selectModel.push(request)
+            return { selected: { provider: request.provider, model: request.model, ...(request.reasoningEffort === undefined ? {} : { reasoningEffort: request.reasoningEffort }) } }
           },
           prompt: async (request) => {
             calls.prompt.push(request)
@@ -905,4 +918,52 @@ test('a spawned worker is attached to the workspace its directory belongs to', a
   const outside = await api.spawn({ taskName: 'w2', message: 'b', forkTurns: 'none', cwd: '/elsewhere' })
   assert.equal(attached.length, 1)
   assert.ok(outside.sessionId)
+})
+
+test('dsh_task switches the worker to the requested provider/model', async () => {
+  const { api, calls } = workerHost()
+  const result = await api.task({ prompt: '做点事', cwd: '/tmp', model: 'zai-coding-cn/glm-5.3', reasoningEffort: 'max' })
+  assert.equal(calls.selectModel.length, 1)
+  assert.deepEqual(calls.selectModel[0], {
+    sessionId: result.sessionId,
+    provider: 'zai-coding-cn',
+    model: 'glm-5.3',
+    reasoningEffort: 'max',
+  })
+  assert.equal(result.model.provider, 'zai-coding-cn')
+  assert.equal(result.model.model, 'glm-5.3')
+  /* The selection must land before the prompt, otherwise the first turn runs on the old model. */
+  assert.equal(calls.prompt.length, 1)
+})
+
+test('a bare model id keeps the default provider', async () => {
+  const { api, calls } = workerHost()
+  await api.spawn({ taskName: 'w', message: 'a', forkTurns: 'none', cwd: '/tmp', model: 'glm-5.3' })
+  assert.equal(calls.selectModel[0].provider, 'opencode-go')
+  assert.equal(calls.selectModel[0].model, 'glm-5.3')
+})
+
+test('dsh_spawn carries the model onto the forked worker too', async () => {
+  const { api, calls } = workerHost()
+  await api.spawn({ taskName: 'w', message: 'a', forkTurns: 'none', cwd: '/tmp' })
+  await api.followup({ worker: 'w', message: '继续', model: 'deepseek-account/deepseek-flash' })
+  assert.equal(calls.selectModel.length, 1)
+  assert.equal(calls.selectModel[0].provider, 'deepseek-account')
+  assert.equal(calls.selectModel[0].model, 'deepseek-flash')
+  assert.equal(calls.selectModel[0].reasoningEffort, undefined)
+})
+
+test('an unusable model spec fails the dispatch with a clear message', async () => {
+  const { api, calls } = workerHost()
+  await assert.rejects(
+    () => api.task({ prompt: 'x', cwd: '/tmp', model: '/glm-5.3' }),
+    /model must look like "provider\/model"/,
+  )
+  assert.equal(calls.prompt.length, 0)
+})
+
+test('no model argument leaves the session untouched', async () => {
+  const { api, calls } = workerHost()
+  await api.task({ prompt: 'x', cwd: '/tmp' })
+  assert.equal(calls.selectModel.length, 0)
 })

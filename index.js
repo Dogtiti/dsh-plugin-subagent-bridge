@@ -94,6 +94,15 @@ const TOOLS = [
           description: 'Continue an existing idle session (multi-turn worker) instead of opening a new one.',
         },
         agentPreset: { type: 'string', description: 'Agent preset for a new session.' },
+        model: {
+          type: 'string',
+          description:
+            'Model to run this worker on, as "provider/model" (for example "zai-coding-cn/glm-5.3"). A bare model id keeps the current default provider. Omit to use whatever the session already uses.',
+        },
+        reasoningEffort: {
+          type: 'string',
+          description: 'Reasoning level for `model`, if that model offers levels (low, medium, high, max...).',
+        },
         timeoutSeconds: { type: 'number', description: 'How long to wait for the turn to finish. Default 300, max 600.' },
       },
       required: ['prompt'],
@@ -116,6 +125,12 @@ const TOOLS = [
         },
         from: { type: 'string', description: 'Session id to fork when fork_turns is "all".' },
         cwd: { type: 'string', description: 'Working directory for a fresh worker.' },
+        model: {
+          type: 'string',
+          description:
+            'Model for this worker, as "provider/model" (for example "opencode-go/deepseek-v4.1-flash"). A bare model id keeps the current default provider.',
+        },
+        reasoningEffort: { type: 'string', description: 'Reasoning level for `model`, when that model offers levels.' },
       },
       required: ['task_name', 'message'],
       additionalProperties: false,
@@ -130,6 +145,11 @@ const TOOLS = [
       properties: {
         worker: { type: 'string', description: 'task_name from dsh_spawn, or a session id.' },
         message: { type: 'string', description: 'Follow-up work order.' },
+        model: {
+          type: 'string',
+          description: 'Switch this worker to another model before the turn, as "provider/model". Omit to keep its current one.',
+        },
+        reasoningEffort: { type: 'string', description: 'Reasoning level for `model`, when that model offers levels.' },
       },
       required: ['worker', 'message'],
       additionalProperties: false,
@@ -483,12 +503,37 @@ async function callTool(id, params, api, signal) {
         if (forkTurns === 'all' && (typeof args.from !== 'string' || args.from === '')) {
           throw new Error('from is required when fork_turns is "all"')
         }
-        return ok(id, text(await api.spawn({ taskName, message, forkTurns, from: args.from, cwd: args.cwd })))
+        return ok(
+          id,
+          text(
+            await api.spawn({
+              taskName,
+              message,
+              forkTurns,
+              from: args.from,
+              cwd: args.cwd,
+              model: typeof args.model === 'string' && args.model !== '' ? args.model : undefined,
+              reasoningEffort:
+                typeof args.reasoningEffort === 'string' && args.reasoningEffort !== '' ? args.reasoningEffort : undefined,
+            }),
+          ),
+        )
       }
       case 'dsh_followup': {
         const worker = requireString(args.worker, 'worker')
         const message = requireString(args.message, 'message')
-        return ok(id, text(await api.followup({ worker, message })))
+        return ok(
+          id,
+          text(
+            await api.followup({
+              worker,
+              message,
+              model: typeof args.model === 'string' && args.model !== '' ? args.model : undefined,
+              reasoningEffort:
+                typeof args.reasoningEffort === 'string' && args.reasoningEffort !== '' ? args.reasoningEffort : undefined,
+            }),
+          ),
+        )
       }
       case 'dsh_close': {
         const worker = requireString(args.worker, 'worker')
@@ -520,6 +565,9 @@ async function callTool(id, params, api, signal) {
               cwd: typeof args.cwd === 'string' && args.cwd !== '' ? args.cwd : undefined,
               sessionId,
               agentPreset: typeof args.agentPreset === 'string' && args.agentPreset !== '' ? args.agentPreset : undefined,
+              model: typeof args.model === 'string' && args.model !== '' ? args.model : undefined,
+              reasoningEffort:
+                typeof args.reasoningEffort === 'string' && args.reasoningEffort !== '' ? args.reasoningEffort : undefined,
               timeoutSeconds,
             }),
           ),
@@ -591,7 +639,7 @@ export function createApi(ctx, state, settings) {
       })
     },
 
-    async spawn({ taskName, message, forkTurns, from, cwd }) {
+    async spawn({ taskName, message, forkTurns, from, cwd, model, reasoningEffort }) {
       const service = controller()
       if (service === undefined || service === null) throw new Error('session controller is unavailable')
       if (state.workers.has(taskName)) throw new Error(`task_name ${JSON.stringify(taskName)} is already in use`)
@@ -616,6 +664,7 @@ export function createApi(ctx, state, settings) {
         if (typeof sessionId !== 'string' || sessionId === '') throw new Error('session controller did not return a session id')
       }
 
+      const appliedModel = await applyModelSpec(ctx, sessionId, model, reasoningEffort)
       const before = Number(sessions()?.get?.(sessionId)?.seq ?? 0)
       const requestId = randomUUID()
       const accepted = await service.prompt(
@@ -634,15 +683,22 @@ export function createApi(ctx, state, settings) {
         updatedAt: Date.now(),
       })
       await saveWorkers(settings, state)
-      return { task_name: taskName, sessionId, accepted: accepted?.accepted === true, fork_turns: forkTurns }
+      return {
+        task_name: taskName,
+        sessionId,
+        accepted: accepted?.accepted === true,
+        fork_turns: forkTurns,
+        ...(appliedModel === undefined ? {} : { model: appliedModel }),
+      }
     },
 
-    async followup({ worker, message }) {
+    async followup({ worker, message, model, reasoningEffort }) {
       const target = resolveWorker(state, worker)
       if (target === undefined) throw new Error(`unknown worker ${JSON.stringify(worker)}`)
       const service = controller()
       if (service === undefined || service === null) throw new Error('session controller is unavailable')
       takeDispatchSlot(state, settings)
+      const appliedModel = await applyModelSpec(ctx, target.sessionId, model, reasoningEffort)
       const before = Number(sessions()?.get?.(target.sessionId)?.seq ?? 0)
       const requestId = randomUUID()
       const accepted = await service.prompt(
@@ -656,7 +712,12 @@ export function createApi(ctx, state, settings) {
         target.record.updatedAt = Date.now()
       }
       await saveWorkers(settings, state)
-      return { worker: target.taskName ?? target.sessionId, sessionId: target.sessionId, accepted: accepted?.accepted === true }
+      return {
+        worker: target.taskName ?? target.sessionId,
+        sessionId: target.sessionId,
+        accepted: accepted?.accepted === true,
+        ...(appliedModel === undefined ? {} : { model: appliedModel }),
+      }
     },
 
     async close({ worker }) {
@@ -680,7 +741,7 @@ export function createApi(ctx, state, settings) {
       return rows
     },
 
-    async task({ prompt, cwd, sessionId, agentPreset, timeoutSeconds }) {
+    async task({ prompt, cwd, sessionId, agentPreset, timeoutSeconds, model, reasoningEffort }) {
       const service = controller()
       if (service === undefined || service === null) throw new Error('session controller is unavailable')
       const seconds = Math.min(
@@ -703,6 +764,7 @@ export function createApi(ctx, state, settings) {
         throw new Error('that session is running; use dsh_dispatch plus dsh_read_result instead')
       }
 
+      const appliedModel = await applyModelSpec(ctx, targetId, model, reasoningEffort)
       const turnBefore = lastTurn(ctx, targetId)
       const before = Number(sessions()?.get?.(targetId)?.seq ?? 0)
       const finished = waitForTurnEnd(ctx, targetId, turnBefore, seconds * 1000)
@@ -745,6 +807,7 @@ export function createApi(ctx, state, settings) {
               next: `the worker is still running; do not end the turn. Call dsh_wait({targets:["${targetId}"],timeoutMs:${String(MAX_BLOCKING_SECONDS * 1000)}}) and repeat until it is not "running".`,
             }
           : {}),
+        ...(appliedModel === undefined ? {} : { model: appliedModel }),
         text: collected.text,
         truncated: collected.truncated,
         turns: lastTurn(ctx, targetId),
@@ -1013,6 +1076,61 @@ function callerDepth(state, sessionId) {
   return 0
 }
 
+
+/**
+ * Read a `provider/model` spec. A bare model name keeps the provider of the current
+ * default selection, so callers can say `model: "glm-5.3"` without repeating the
+ * provider they already run.
+ * @param ctx - Host context.
+ * @param spec - `provider/model` or a bare model id.
+ * @returns {{ provider: string, model: string }} resolved pair.
+ */
+function parseModelSpec(ctx, spec) {
+  const raw = String(spec).trim()
+  if (raw === '') throw new Error('model must not be empty')
+  if (raw.startsWith('/') || raw.endsWith('/') || raw.includes('//')) {
+    throw new Error(`model must look like "provider/model", got ${JSON.stringify(spec)}`)
+  }
+  const slash = raw.indexOf('/')
+  if (slash > 0) {
+    const provider = raw.slice(0, slash).trim()
+    const model = raw.slice(slash + 1).trim()
+    if (provider === '' || model === '') throw new Error(`model must look like "provider/model", got ${JSON.stringify(spec)}`)
+    return { provider, model }
+  }
+  const current = ctx.get('agentDefaultModel')?.currentSelection?.()
+  const provider = typeof current?.provider === 'string' ? current.provider : ''
+  if (provider === '') throw new Error('model without a provider needs a default selection; pass "provider/model"')
+  return { provider, model: raw }
+}
+
+/**
+ * Install a model selection on one session before its next turn.
+ * `sessionController.selectModel` validates the pair and applies it to the next request.
+ * @param ctx - Host context.
+ * @param sessionId - session to switch.
+ * @param spec - `provider/model` or a bare model id.
+ * @param reasoningEffort - optional effort level.
+ * @returns {{ provider: string, model: string, reasoningEffort?: string } | undefined} applied selection.
+ */
+async function applyModelSpec(ctx, sessionId, spec, reasoningEffort) {
+  if (typeof spec !== 'string' || spec.trim() === '') return undefined
+  const service = ctx.get('sessionController')
+  if (service === undefined || service === null) throw new Error('session controller is unavailable')
+  if (typeof service.selectModel !== 'function') throw new Error('this Host does not expose selectModel; update DeepSeek Harness')
+  const { provider, model } = parseModelSpec(ctx, spec)
+  try {
+    const result = await service.selectModel({
+      sessionId,
+      provider,
+      model,
+      ...(typeof reasoningEffort === 'string' && reasoningEffort !== '' ? { reasoningEffort } : {}),
+    })
+    return result?.selected ?? { provider, model, ...(reasoningEffort ? { reasoningEffort } : {}) }
+  } catch (error) {
+    throw new Error(`cannot switch ${String(sessionId)} to ${provider}/${model}: ${String(error?.message ?? error)}`)
+  }
+}
 
 /**
  * Place a freshly created session in the workspace its directory belongs to.
