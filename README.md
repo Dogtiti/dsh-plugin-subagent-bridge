@@ -11,6 +11,30 @@
 
 ---
 
+## 创建项目（workspace）
+
+DSH 的侧边栏分组是"项目（workspace）"，和会话的工作目录是两回事：新建会话默认落在「未分组」，除非它所在的目录已经是一个项目。
+
+`dsh_task` / `dsh_spawn` 的 `workspace` 参数把这一步也接管了：
+
+```js
+// 目录不是项目 → 用它创建项目（标题取目录名），会话直接归到项目下
+dsh_task({ prompt: "…", cwd: "/repo/clawer", workspace: true })
+
+// 用指定标题创建
+dsh_spawn({ task_name: "w1", message: "…", cwd: "/repo/clawer", workspace: "Clawer" })
+
+// 不传 → 只复用已有项目；目录没有项目就保持未分组（和以前一样）
+dsh_task({ prompt: "…", cwd: "/repo/clawer" })
+```
+
+行为细节：
+
+- 目录不存在时先递归创建，再做项目登记（登记要求目录已存在）；
+- 目录已经是项目 → **直接复用，不改标题**（底层 `create` 对同一路径返回已有记录）；
+- 返回结果里带上 `workspace: { id, title, path }`，方便确认落在哪个项目；
+- 项目操作失败不影响派发本身（分组是外观，不因此让任务失败）。
+
 ## 指定模型
 
 `dsh_task`、`dsh_spawn`、`dsh_followup` 都可以带 `model`，让 worker 跑在指定模型上：

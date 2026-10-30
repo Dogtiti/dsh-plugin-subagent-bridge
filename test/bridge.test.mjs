@@ -382,6 +382,23 @@ function taskHost(options = {}) {
     get(name) {
       if (name === 'sessions') return { get: (id) => (id === 'session-worker' ? session : undefined) }
       if (name === 'agents') return { get: () => ({ status: 'idle' }) }
+      if (name === 'workspaceRegistry') {
+        return {
+          resolveByPath: async (path) => (options.workspaceByPath?.[path] ?? undefined),
+          create: async (path, title) => {
+            calls.workspaceCreate.push({ path, title })
+            const workspace = {
+              id: `ws-${String(calls.workspaceCreate.length)}`,
+              path,
+              title: title ?? path.split('/').filter(Boolean).pop() ?? path,
+              attached: [],
+              attachSession: async (id) => { workspace.attached.push(id) },
+            }
+            calls.workspaceAttached.push(workspace)
+            return workspace
+          },
+        }
+      }
       if (name === 'agentDefaultModel') {
         return { currentSelection: () => options.defaultSelection ?? { provider: 'opencode-go', model: 'deepseek-v4.1-flash' } }
       }
@@ -448,6 +465,23 @@ test('dsh_task delivers only the final answer, not the whole turn', async () => 
     get(name) {
       if (name === 'sessions') return { get: (id) => (id === 'session-worker' ? session : undefined) }
       if (name === 'agents') return { get: () => ({ status: 'idle' }) }
+      if (name === 'workspaceRegistry') {
+        return {
+          resolveByPath: async (path) => (options.workspaceByPath?.[path] ?? undefined),
+          create: async (path, title) => {
+            calls.workspaceCreate.push({ path, title })
+            const workspace = {
+              id: `ws-${String(calls.workspaceCreate.length)}`,
+              path,
+              title: title ?? path.split('/').filter(Boolean).pop() ?? path,
+              attached: [],
+              attachSession: async (id) => { workspace.attached.push(id) },
+            }
+            calls.workspaceAttached.push(workspace)
+            return workspace
+          },
+        }
+      }
       if (name === 'agentDefaultModel') {
         return { currentSelection: () => options.defaultSelection ?? { provider: 'opencode-go', model: 'deepseek-v4.1-flash' } }
       }
@@ -547,7 +581,7 @@ test('dsh_wait marks sessions this bridge never dispatched and reports errors', 
  * @returns an api plus the recorded calls.
  */
 function workerHost(options = {}) {
-  const calls = { create: [], fork: [], prompt: [], selectModel: [] }
+  const calls = { create: [], fork: [], prompt: [], selectModel: [], workspaceCreate: [], workspaceAttached: [] }
   const sessions = new Map()
   const listeners = new Set()
   let counter = 0
@@ -564,6 +598,23 @@ function workerHost(options = {}) {
     get(name) {
       if (name === 'sessions') return { get: (id) => sessions.get(id) }
       if (name === 'agents') return { get: () => ({ status: 'idle' }) }
+      if (name === 'workspaceRegistry') {
+        return {
+          resolveByPath: async (path) => (options.workspaceByPath?.[path] ?? undefined),
+          create: async (path, title) => {
+            calls.workspaceCreate.push({ path, title })
+            const workspace = {
+              id: `ws-${String(calls.workspaceCreate.length)}`,
+              path,
+              title: title ?? path.split('/').filter(Boolean).pop() ?? path,
+              attached: [],
+              attachSession: async (id) => { workspace.attached.push(id) },
+            }
+            calls.workspaceAttached.push(workspace)
+            return workspace
+          },
+        }
+      }
       if (name === 'agentDefaultModel') {
         return { currentSelection: () => options.defaultSelection ?? { provider: 'opencode-go', model: 'deepseek-v4.1-flash' } }
       }
@@ -966,4 +1017,35 @@ test('no model argument leaves the session untouched', async () => {
   const { api, calls } = workerHost()
   await api.task({ prompt: 'x', cwd: '/tmp' })
   assert.equal(calls.selectModel.length, 0)
+})
+
+test('workspace: true creates a project for the directory and groups the worker in it', async () => {
+  const { api, calls } = workerHost()
+  const result = await api.task({ prompt: 'x', cwd: '/repo/new-project', workspace: true })
+  assert.deepEqual(calls.workspaceCreate, [{ path: '/repo/new-project', title: undefined }])
+  assert.deepEqual(calls.workspaceAttached[0].attached, [result.sessionId])
+  assert.equal(result.workspace.title, 'new-project')
+})
+
+test('a workspace title is passed through', async () => {
+  const { api, calls } = workerHost()
+  const result = await api.spawn({ taskName: 'w', message: 'x', forkTurns: 'none', cwd: '/repo/p', workspace: 'Clawer' })
+  assert.deepEqual(calls.workspaceCreate, [{ path: '/repo/p', title: 'Clawer' }])
+  assert.equal(result.workspace.title, 'Clawer')
+})
+
+test('without the flag an unowned directory leaves the worker ungrouped, and is never created', async () => {
+  const { api, calls } = workerHost()
+  const result = await api.task({ prompt: 'x', cwd: '/repo/loose' })
+  assert.equal(calls.workspaceCreate.length, 0)
+  assert.equal(result.workspace, undefined)
+})
+
+test('an existing project is reused instead of created', async () => {
+  const existing = { id: 'ws-known', path: '/repo/known', title: 'Known', attached: [], attachSession: async (id) => { existing.attached.push(id) } }
+  const { api, calls } = workerHost({ workspaceByPath: { '/repo/known': existing } })
+  const result = await api.task({ prompt: 'x', cwd: '/repo/known' })
+  assert.equal(calls.workspaceCreate.length, 0)
+  assert.deepEqual(existing.attached, [result.sessionId])
+  assert.equal(result.workspace.title, 'Known')
 })

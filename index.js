@@ -99,6 +99,11 @@ const TOOLS = [
           description:
             'Model to run this worker on, as "provider/model" (for example "zai-coding-cn/glm-5.3"). A bare model id keeps the current default provider. Omit to use whatever the session already uses.',
         },
+        workspace: {
+          type: ['boolean', 'string'],
+          description:
+            'Grouping for the new session. true creates a DSH project (workspace) for `cwd`, titled after its last path segment, when none owns that directory yet; a string uses that title instead. Omit (or false) to only reuse an existing project, leaving the session ungrouped when the directory has none.',
+        },
         reasoningEffort: {
           type: 'string',
           description: 'Reasoning level for `model`, if that model offers levels (low, medium, high, max...).',
@@ -129,6 +134,11 @@ const TOOLS = [
           type: 'string',
           description:
             'Model for this worker, as "provider/model" (for example "opencode-go/deepseek-v4.1-flash"). A bare model id keeps the current default provider.',
+        },
+        workspace: {
+          type: ['boolean', 'string'],
+          description:
+            'Grouping for the new worker. true creates a DSH project (workspace) for `cwd` when none owns it; a string uses that title. Omit to only reuse an existing project.',
         },
         reasoningEffort: { type: 'string', description: 'Reasoning level for `model`, when that model offers levels.' },
       },
@@ -512,6 +522,7 @@ async function callTool(id, params, api, signal) {
               forkTurns,
               from: args.from,
               cwd: args.cwd,
+              workspace: args.workspace === true || (typeof args.workspace === 'string' && args.workspace !== '') ? args.workspace : undefined,
               model: typeof args.model === 'string' && args.model !== '' ? args.model : undefined,
               reasoningEffort:
                 typeof args.reasoningEffort === 'string' && args.reasoningEffort !== '' ? args.reasoningEffort : undefined,
@@ -565,6 +576,7 @@ async function callTool(id, params, api, signal) {
               cwd: typeof args.cwd === 'string' && args.cwd !== '' ? args.cwd : undefined,
               sessionId,
               agentPreset: typeof args.agentPreset === 'string' && args.agentPreset !== '' ? args.agentPreset : undefined,
+              workspace: args.workspace === true || (typeof args.workspace === 'string' && args.workspace !== '') ? args.workspace : undefined,
               model: typeof args.model === 'string' && args.model !== '' ? args.model : undefined,
               reasoningEffort:
                 typeof args.reasoningEffort === 'string' && args.reasoningEffort !== '' ? args.reasoningEffort : undefined,
@@ -639,7 +651,7 @@ export function createApi(ctx, state, settings) {
       })
     },
 
-    async spawn({ taskName, message, forkTurns, from, cwd, model, reasoningEffort }) {
+    async spawn({ taskName, message, forkTurns, from, cwd, model, reasoningEffort, workspace }) {
       const service = controller()
       if (service === undefined || service === null) throw new Error('session controller is unavailable')
       if (state.workers.has(taskName)) throw new Error(`task_name ${JSON.stringify(taskName)} is already in use`)
@@ -648,6 +660,7 @@ export function createApi(ctx, state, settings) {
       takeDispatchSlot(state, settings)
       assertCapacity(state, settings, root)
 
+      let placed
       let sessionId
       if (forkTurns === 'all') {
         const parent = sessions()?.get?.(from)
@@ -660,7 +673,9 @@ export function createApi(ctx, state, settings) {
       } else {
         const opened = await service.create(cwd === undefined ? {} : { cwd })
         sessionId = opened?.sessionId
-        if (typeof sessionId === 'string' && sessionId !== '') await attachToWorkspace(ctx, sessionId, cwd ?? undefined)
+        if (typeof sessionId === 'string' && sessionId !== '') {
+          placed = await attachToWorkspace(ctx, sessionId, cwd ?? undefined, workspaceOptions(workspace))
+        }
         if (typeof sessionId !== 'string' || sessionId === '') throw new Error('session controller did not return a session id')
       }
 
@@ -689,6 +704,7 @@ export function createApi(ctx, state, settings) {
         accepted: accepted?.accepted === true,
         fork_turns: forkTurns,
         ...(appliedModel === undefined ? {} : { model: appliedModel }),
+        ...(placed === undefined ? {} : { workspace: placed }),
       }
     },
 
@@ -741,7 +757,7 @@ export function createApi(ctx, state, settings) {
       return rows
     },
 
-    async task({ prompt, cwd, sessionId, agentPreset, timeoutSeconds, model, reasoningEffort }) {
+    async task({ prompt, cwd, sessionId, agentPreset, timeoutSeconds, model, reasoningEffort, workspace }) {
       const service = controller()
       if (service === undefined || service === null) throw new Error('session controller is unavailable')
       const seconds = Math.min(
@@ -752,12 +768,15 @@ export function createApi(ctx, state, settings) {
       takeDispatchSlot(state, settings)
       const started = Date.now()
 
+      let placed
       let targetId = sessionId
       let created = false
       if (targetId === undefined) {
         const opened = await service.create(cwd === undefined ? {} : { cwd })
         targetId = opened?.sessionId
-        if (typeof targetId === 'string' && targetId !== '') await attachToWorkspace(ctx, targetId, cwd ?? undefined)
+        if (typeof targetId === 'string' && targetId !== '') {
+          placed = await attachToWorkspace(ctx, targetId, cwd ?? undefined, workspaceOptions(workspace))
+        }
         if (typeof targetId !== 'string' || targetId === '') throw new Error('session controller did not return a session id')
         created = true
       } else if (ctx.get('agents')?.get?.(targetId)?.status === 'running') {
@@ -808,6 +827,7 @@ export function createApi(ctx, state, settings) {
             }
           : {}),
         ...(appliedModel === undefined ? {} : { model: appliedModel }),
+        ...(placed === undefined ? {} : { workspace: placed }),
         text: collected.text,
         truncated: collected.truncated,
         turns: lastTurn(ctx, targetId),
@@ -1133,6 +1153,20 @@ async function applyModelSpec(ctx, sessionId, spec, reasoningEffort) {
 }
 
 /**
+ * Translate the `workspace` argument into attach options.
+ * - absent / `false` → never create, only reuse an existing project for the directory
+ * - `true` → create a project titled after the directory when none owns it
+ * - a string → same, with that title
+ * @param workspace - raw argument from the tool call.
+ * @returns options for {@link attachToWorkspace}.
+ */
+function workspaceOptions(workspace) {
+  if (workspace === true) return { create: true }
+  if (typeof workspace === 'string' && workspace.trim() !== '') return { create: true, title: workspace.trim() }
+  return {}
+}
+
+/**
  * Place a freshly created session in the workspace its directory belongs to.
  * `sessionController.create` only records a working directory; the sidebar groups
  * live in a separate registry, so without this step a worker shows up as ungrouped.
@@ -1140,14 +1174,32 @@ async function applyModelSpec(ctx, sessionId, spec, reasoningEffort) {
  * @param sessionId - session just created.
  * @param cwd - directory the session was opened in.
  */
-async function attachToWorkspace(ctx, sessionId, cwd) {
-  if (typeof cwd !== 'string' || cwd === '') return
+async function attachToWorkspace(ctx, sessionId, cwd, options = {}) {
+  if (typeof cwd !== 'string' || cwd === '') return undefined
   try {
     const registry = ctx.get('workspaceRegistry')
-    const workspace = await registry?.resolveByPath?.(cwd)
+    if (registry === undefined || registry === null) return undefined
+
+    /* Only create when the caller asked for it: an existing project is reused either way,
+     * because `create` returns the record that already owns the canonical path. */
+    let workspace
+    if (options.create === true && typeof registry.create === 'function') {
+      /* The registry rejects a directory that does not exist yet, and a brand-new project
+       * is exactly that, so the path is materialised first. */
+      await mkdir(cwd, { recursive: true }).catch(() => {})
+      const title = typeof options.title === 'string' && options.title.trim() !== '' ? options.title.trim() : undefined
+      workspace = await registry.create(cwd, title)
+    } else {
+      workspace = await registry.resolveByPath?.(cwd)
+    }
+
     await workspace?.attachSession?.(sessionId)
+    return workspace === undefined || workspace === null
+      ? undefined
+      : { id: workspace.id, title: workspace.title, path: workspace.path }
   } catch {
     /* Grouping is cosmetic: a failure here must not fail the dispatch. */
+    return undefined
   }
 }
 
