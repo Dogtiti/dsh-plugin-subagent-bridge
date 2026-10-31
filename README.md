@@ -11,6 +11,27 @@
 
 ---
 
+## 让 DSH 派活给 Claude
+
+反向那一侧以前只有 Codex。现在多了 `claude_dispatch`：DSH 里的 agent 可以把任务交给 Claude Code，拿回最终回答。
+
+```js
+claude_dispatch({ prompt: "审一下这个 PR 的风险", cwd: "/repo", resume: "a4925654-…", model: "sonnet" })
+```
+
+| 参数 | 说明 |
+| --- | --- |
+| `prompt` | 必填，任务正文 |
+| `cwd` | 工作目录；默认用当前会话目录 |
+| `resume` | Claude Code 的 session id，续接同一段对话 |
+| `model` | 模型别名或 id；不传则用配置，再退回 Claude 自己的设置 |
+
+返回 `{ ok, text, sessionId, durationMs }`，`sessionId` 就是下次 `resume` 用的那个。
+
+和 `codex_dispatch` 的差别只在底层：Claude Code 的 `-p` 模式**一次输出一个 JSON 对象**（`{type:"result", result, session_id, is_error}`），不像 Codex 是事件流。所以解析器只看 stdout 的 JSON，**stderr 的警告不算失败**——比如模型名带 `[1M]` 后缀时 CLI 会警告，但仍然正常返回。
+
+配置项：`claudeBin`（默认 `claude`）、`claudeModel`（默认空，即用 CLI 自己的设置）、`claudeTimeoutMs`（默认 300 秒，上限 240 秒夹取）。
+
 ## 创建项目（workspace）
 
 DSH 的侧边栏分组是"项目（workspace）"，和会话的工作目录是两回事：新建会话默认落在「未分组」，除非它所在的目录已经是一个项目。

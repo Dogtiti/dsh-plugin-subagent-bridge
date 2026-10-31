@@ -50,6 +50,14 @@ const MAX_RESULT_CHARS = 20000
 const MAX_WAIT_SECONDS = 55
 
 /** Where a `codex` binary commonly lives when the Host's PATH is minimal. */
+const CLAUDE_CANDIDATES = [
+  '~/.local/bin/claude',
+  '~/.claude/local/claude',
+  '/opt/homebrew/bin/claude',
+  '/usr/local/bin/claude',
+  '~/.npm-global/bin/claude',
+]
+
 const CODEX_CANDIDATES = [
   '~/Library/pnpm/bin/codex',
   '~/.local/bin/codex',
@@ -67,6 +75,9 @@ const DEFAULTS = {
   codexBin: 'codex',
   codexSandbox: 'workspace-write',
   codexTimeoutMs: 300000,
+  claudeBin: 'claude',
+  claudeModel: '',
+  claudeTimeoutMs: 300000,
   taskTimeoutSeconds: MAX_BLOCKING_SECONDS,
   waitTimeoutMs: MAX_BLOCKING_SECONDS * 1000,
   maxWorkers: 12,
@@ -354,6 +365,62 @@ export function apply(ctx, config = {}) {
           execute: (args, exec) => api.dispatchCodex(args, exec),
         }),
       'subagent-bridge: codex tool',
+    )
+  })
+
+  /* Reverse direction for Claude Code: the same shape, a different CLI. */
+  ctx.inject(['tools'], (toolCtx) => {
+    toolCtx.effect(
+      () =>
+        toolCtx.tools.register({
+          name: 'claude_dispatch',
+          description:
+            'Hand a task to Claude Code (a separate coding agent) and return its final answer. Runs `claude -p` in the working directory; use `resume` with a previous sessionId to continue that conversation.',
+          parameters: {
+            type: 'object',
+            properties: {
+              prompt: { type: 'string', description: 'Task text for Claude Code.' },
+              cwd: { type: 'string', description: 'Working directory. Defaults to this session working directory.' },
+              resume: { type: 'string', description: 'Claude Code session id to continue instead of starting a new one.' },
+              model: { type: 'string', description: 'Model alias or id for this run. Defaults to the plugin config, then to Claude Code own settings.' },
+            },
+            required: ['prompt'],
+            additionalProperties: false,
+          },
+          output: {
+            schema: {
+              type: 'object',
+              properties: {
+                ok: { type: 'boolean' },
+                text: { type: 'string' },
+                sessionId: { type: 'string' },
+                exitCode: { type: 'number' },
+                durationMs: { type: 'number' },
+                error: { type: 'string' },
+              },
+              required: ['ok', 'text'],
+              additionalProperties: false,
+            },
+            render(_args, value) {
+              const result = value ?? {}
+              if (result.ok !== true) {
+                return [{ type: 'text', text: `claude_dispatch failed: ${String(result.error ?? 'unknown error')}` }]
+              }
+              const meta = [
+                typeof result.sessionId === 'string' ? `session ${result.sessionId}` : undefined,
+                typeof result.durationMs === 'number' ? `${Math.round(result.durationMs / 1000)}s` : undefined,
+              ]
+                .filter((part) => part !== undefined)
+                .join(' · ')
+              const body = String(result.text ?? '')
+              return [{ type: 'text', text: meta === '' ? body : `${body}\n\n[claude ${meta}]` }]
+            },
+          },
+          timeoutMs: settings.claudeTimeoutMs + 15000,
+          isConcurrencySafe: () => false,
+          execute: (args, exec) => api.dispatchClaude(args, exec),
+        }),
+      'subagent-bridge: claude tool',
     )
   })
 }
@@ -909,6 +976,28 @@ export function createApi(ctx, state, settings) {
         if (remaining <= 0) return { ...snapshot, timedOut: true, waitedMs }
         if (signal?.aborted === true) return { ...snapshot, timedOut: true, waitedMs, aborted: true }
         await sleep(Math.min(300, remaining))
+      }
+    },
+
+    async dispatchClaude(args, exec) {
+      const prompt = requireString(args?.prompt, 'prompt')
+      const depth = guardDepth(state, settings, callerDepth(state, exec?.agent?.id), 'claude_dispatch')
+      takeDispatchSlot(state, settings)
+      const cwd = await resolveCwd(ctx, args?.cwd, exec)
+      enterChain(state, depth, settings.claudeTimeoutMs + 5000)
+      try {
+        return await runClaude({
+          bin: resolveClaude(settings.claudeBin),
+          prompt,
+          cwd,
+          resume: typeof args?.resume === 'string' && args.resume !== '' ? args.resume : undefined,
+          model: typeof args?.model === 'string' && args.model !== '' ? args.model : settings.claudeModel,
+          timeoutMs: settings.claudeTimeoutMs,
+          signal: exec?.signal,
+          children: state.children,
+        })
+      } finally {
+        leaveChain(state)
       }
     },
 
@@ -1620,6 +1709,174 @@ export function resolveCodex(configured) {
   return undefined
 }
 
+
+/**
+ * Locate the Claude Code executable.
+ * @param configured - configured path or bare command name.
+ * @returns the command to spawn, or undefined.
+ */
+export function resolveClaude(configured) {
+  const configuredValue = typeof configured === 'string' ? configured : ''
+  /* An explicit path is authoritative: never silently run a different binary. */
+  if (configuredValue.includes('/')) {
+    const expanded = expandHome(configuredValue)
+    return existsSync(expanded) ? expanded : undefined
+  }
+  for (const directory of String(process.env.PATH ?? '').split(':')) {
+    if (directory !== '' && existsSync(join(directory, 'claude'))) return 'claude'
+  }
+  for (const candidate of CLAUDE_CANDIDATES) {
+    const expanded = expandHome(candidate)
+    if (existsSync(expanded)) return expanded
+  }
+  return undefined
+}
+
+/**
+ * Run one `claude -p` turn and return its final answer.
+ *
+ * Claude Code prints a single JSON object in print mode, so the whole answer arrives at
+ * once — unlike Codex, which streams events. Anything on stderr is advisory: the CLI
+ * warns about an unrecognised model suffix while still succeeding, so only the JSON
+ * envelope decides the outcome.
+ * @param options - binary, prompt, cwd, resume id, model, timeout, signal, child registry.
+ * @returns `{ ok, text, sessionId?, durationMs, exitCode, error? }`.
+ */
+export async function runClaude({
+  bin,
+  prompt,
+  cwd,
+  resume,
+  model,
+  timeoutMs,
+  signal,
+  children,
+  spawnImpl = spawn,
+}) {
+  const started = Date.now()
+  if (bin === undefined) {
+    return { ok: false, text: '', exitCode: -1, durationMs: 0, error: 'claude executable not found; set config.claudeBin' }
+  }
+  const args = ['-p', prompt, '--output-format', 'json']
+  if (typeof resume === 'string' && resume !== '') args.unshift('--resume', resume)
+  if (typeof model === 'string' && model !== '') args.push('--model', model)
+
+  const outcome = await new Promise((resolve) => {
+    let child
+    try {
+      child = spawnImpl(bin, args, { cwd: cwd ?? homedir(), stdio: ['ignore', 'pipe', 'pipe'] })
+    } catch (error) {
+      resolve({ exitCode: -1, stdout: '', stderr: String(error), error: String(error) })
+      return
+    }
+    children?.add(child)
+    let stdout = ''
+    let stderr = ''
+    let settled = false
+    const finish = (value) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      signal?.removeEventListener?.('abort', abort)
+      children?.delete(child)
+      resolve(value)
+    }
+    const kill = (reason) => {
+      try {
+        child.kill('SIGTERM')
+      } catch {
+        /* Already gone. */
+      }
+      setTimeout(() => {
+        try {
+          child.kill('SIGKILL')
+        } catch {
+          /* Already gone. */
+        }
+      }, 5000).unref?.()
+      finish({ exitCode: -1, stdout, stderr, error: reason })
+    }
+    const timer = setTimeout(() => kill(`claude timed out after ${timeoutMs} ms`), Math.max(1000, timeoutMs ?? 300000))
+    const abort = () => kill('cancelled by the caller')
+    if (signal?.aborted === true) abort()
+    else signal?.addEventListener?.('abort', abort)
+    child.stdout?.on('data', (chunk) => {
+      stdout += chunk.toString('utf8')
+    })
+    child.stderr?.on('data', (chunk) => {
+      stderr += chunk.toString('utf8')
+    })
+    child.on('error', (error) => finish({ exitCode: -1, stdout, stderr, error: error.message }))
+    child.on('close', (code) => finish({ exitCode: code ?? -1, stdout, stderr }))
+  })
+
+  const parsed = parseClaudeOutput(outcome.stdout)
+  const durationMs = Date.now() - started
+  const build = (ok, error) => ({
+    ok,
+    text: parsed.text,
+    exitCode: ok ? 0 : outcome.exitCode,
+    durationMs,
+    ...(parsed.sessionId === undefined ? {} : { sessionId: parsed.sessionId }),
+    ...(error === undefined ? {} : { error }),
+  })
+  if (outcome.error !== undefined) return build(false, outcome.error)
+  if (parsed.error !== undefined) return build(false, parsed.error)
+  if (outcome.exitCode !== 0) {
+    const detail = outcome.stderr.trim().split('\n').slice(-3).join('\n')
+    return build(false, `claude exited with ${outcome.exitCode}${detail === '' ? '' : `: ${detail}`}`)
+  }
+  return build(true, undefined)
+}
+
+/**
+ * Read the print-mode JSON envelope.
+ * @param stdout - raw standard output.
+ * @returns `{ text, sessionId?, error? }`.
+ */
+export function parseClaudeOutput(stdout) {
+  const raw = String(stdout ?? '').trim()
+  if (raw === '') return { text: '', error: 'claude printed nothing' }
+  /* A single object is the documented shape, but the CLI writes advisory lines to the
+   * same stream, and those lines can carry braces of their own. Parse whole output first,
+   * then scan lines backwards for the envelope that carries a result. */
+  const lines = raw.split('\n').map((line) => line.trim()).filter((line) => line !== '')
+  const candidates = [...lines].reverse()
+  let payload
+  let lastError
+  for (const candidate of candidates) {
+    if (!candidate.startsWith('{') || !candidate.endsWith('}')) continue
+    try {
+      const parsed = JSON.parse(candidate)
+      if (typeof parsed === 'object' && parsed !== null && typeof parsed.type === 'string') {
+        payload = parsed
+        break
+      }
+    } catch (error) {
+      lastError = error
+    }
+  }
+  if (payload === undefined) {
+    if (lastError !== undefined) {
+      return { text: '', error: `claude printed invalid JSON: ${String(lastError?.message ?? lastError)}` }
+    }
+    return { text: '', error: `claude printed no result envelope: ${raw.slice(0, 200)}` }
+  }
+  const text = typeof payload.result === 'string' ? payload.result.trim() : ''
+  const sessionId = typeof payload.session_id === 'string' && payload.session_id !== '' ? payload.session_id : undefined
+  const failed = payload.is_error === true || (typeof payload.subtype === 'string' && payload.subtype !== 'success')
+  const build = {
+    text,
+    ...(sessionId === undefined ? {} : { sessionId }),
+  }
+  if (failed !== true) return build
+  const detail =
+    typeof payload.result === 'string' && payload.result.trim() !== ''
+      ? payload.result.trim()
+      : `claude reported ${String(payload.subtype ?? payload.terminal_reason ?? 'an error')}`
+  return { ...build, error: detail }
+}
+
 /**
  * Read a file, tolerating absence.
  * @param path - file path.
@@ -1799,6 +2056,8 @@ function resolveSettings(config) {
     }
     if (key === 'codexBin' && typeof value === 'string' && value !== '') merged.codexBin = value
     if (key === 'codexSandbox' && typeof value === 'string' && value !== '') merged.codexSandbox = value
+    if (key === 'claudeBin' && typeof value === 'string' && value !== '') merged.claudeBin = value
+    if (key === 'claudeModel' && typeof value === 'string') merged.claudeModel = value
     if (key === 'workersFile' && typeof value === 'string' && value !== '') merged.workersFile = expandHome(value)
     if (key === 'maxHops') {
       const hops = Number(value)
@@ -1831,6 +2090,11 @@ function resolveSettings(config) {
     if (key === 'taskTimeoutSeconds') {
       const seconds = Number(value)
       if (Number.isFinite(seconds) && seconds > 0) merged.taskTimeoutSeconds = Math.min(MAX_BLOCKING_SECONDS, seconds)
+    }
+    if (key === 'claudeTimeoutMs') {
+      const ms = Number(value)
+      if (Number.isFinite(ms) && ms >= 1000) merged.claudeTimeoutMs = Math.min(ms, MAX_BLOCKING_SECONDS * 1000)
+      continue
     }
     if (key === 'codexTimeoutMs') {
       const ms = Number(value)

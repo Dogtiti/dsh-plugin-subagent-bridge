@@ -3,7 +3,7 @@ import test from 'node:test'
 
 import { EventEmitter } from 'node:events'
 
-import { createApi, createBridgeServer, handleJsonRpc, parseCodexOutput, resolveCodex, runCodex } from '../index.js'
+import { createApi, createBridgeServer, handleJsonRpc, parseCodexOutput, resolveCodex, runCodex, parseClaudeOutput, runClaude } from '../index.js'
 
 const SESSION_ID = 'session-test'
 const TOKEN = 'k'.repeat(32)
@@ -1048,4 +1048,75 @@ test('an existing project is reused instead of created', async () => {
   assert.equal(calls.workspaceCreate.length, 0)
   assert.deepEqual(existing.attached, [result.sessionId])
   assert.equal(result.workspace.title, 'Known')
+})
+
+test('parseClaudeOutput reads the print-mode envelope', () => {
+  const body = JSON.stringify({
+    type: 'result',
+    subtype: 'success',
+    is_error: false,
+    result: '收到\n',
+    session_id: 'a4925654-3235-4232-92ec-1b667ef2dc7d',
+  })
+  assert.deepEqual(parseClaudeOutput(body), {
+    text: '收到',
+    sessionId: 'a4925654-3235-4232-92ec-1b667ef2dc7d',
+  })
+})
+
+test('parseClaudeOutput treats an error envelope as a failure', () => {
+  const body = JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, result: 'boom', session_id: 's1' })
+  const parsed = parseClaudeOutput(body)
+  assert.equal(parsed.text, 'boom')
+  assert.equal(parsed.error, 'boom')
+  assert.equal(parsed.sessionId, 's1')
+})
+
+test('parseClaudeOutput survives noise before the JSON', () => {
+  const parsed = parseClaudeOutput('[claude-code:unrecognized_model] {"model":"x"}\n{"type":"result","subtype":"success","result":"ok"}')
+  assert.equal(parsed.text, 'ok')
+  assert.equal(parsed.error, undefined)
+})
+
+test('runClaude never fails because stderr carried a warning', async () => {
+  const spawnImpl = () => {
+    const child = new EventEmitter()
+    child.stdout = new EventEmitter()
+    child.stderr = new EventEmitter()
+    child.kill = () => {}
+    setTimeout(() => {
+      child.stderr.emit('data', '[claude-code:unrecognized_model] {"model":"deepseek-flash[1m]"}\n')
+      child.stdout.emit('data', JSON.stringify({ type: 'result', subtype: 'success', result: '可以', session_id: 'sid-1' }))
+      child.emit('close', 0)
+    }, 0)
+    return child
+  }
+  const result = await runClaude({ bin: '/fake/claude', prompt: 'x', timeoutMs: 5000, spawnImpl })
+  assert.equal(result.ok, true)
+  assert.equal(result.text, '可以')
+  assert.equal(result.sessionId, 'sid-1')
+})
+
+test('runClaude reports a missing binary instead of throwing', async () => {
+  const result = await runClaude({ bin: undefined, prompt: 'x', timeoutMs: 1000 })
+  assert.equal(result.ok, false)
+  assert.match(String(result.error), /claude executable not found/)
+})
+
+test('runClaude passes resume and model through to the CLI', async () => {
+  let seen
+  const spawnImpl = (bin, args) => {
+    seen = { bin, args }
+    const child = new EventEmitter()
+    child.stdout = new EventEmitter()
+    child.stderr = new EventEmitter()
+    child.kill = () => {}
+    setTimeout(() => {
+      child.stdout.emit('data', JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }))
+      child.emit('close', 0)
+    }, 0)
+    return child
+  }
+  await runClaude({ bin: '/fake/claude', prompt: '接着做', resume: 'sid-9', model: 'sonnet', timeoutMs: 5000, spawnImpl })
+  assert.deepEqual(seen.args, ['--resume', 'sid-9', '-p', '接着做', '--output-format', 'json', '--model', 'sonnet'])
 })
