@@ -115,6 +115,13 @@ const TOOLS = [
           description:
             'Grouping for the new session. true creates a DSH project (workspace) for `cwd`, titled after its last path segment, when none owns that directory yet; a string uses that title instead. Omit (or false) to only reuse an existing project, leaving the session ungrouped when the directory has none.',
         },
+        mode: {
+          type: 'string',
+          enum: ['queue', 'steer'],
+          description:
+            'delivery: "queue" (default) waits for the running turn to finish, "steer" interrupts it and inserts this message now.',
+        },
+
         reasoningEffort: {
           type: 'string',
           description: 'Reasoning level for `model`, if that model offers levels (low, medium, high, max...).',
@@ -151,6 +158,13 @@ const TOOLS = [
           description:
             'Grouping for the new worker. true creates a DSH project (workspace) for `cwd` when none owns it; a string uses that title. Omit to only reuse an existing project.',
         },
+        mode: {
+          type: 'string',
+          enum: ['queue', 'steer'],
+          description:
+            'delivery: "queue" (default) waits for the running turn to finish, "steer" interrupts it and inserts this message now.',
+        },
+
         reasoningEffort: { type: 'string', description: 'Reasoning level for `model`, when that model offers levels.' },
       },
       required: ['task_name', 'message'],
@@ -171,6 +185,12 @@ const TOOLS = [
           description: 'Switch this worker to another model before the turn, as "provider/model". Omit to keep its current one.',
         },
         reasoningEffort: { type: 'string', description: 'Reasoning level for `model`, when that model offers levels.' },
+        mode: {
+          type: 'string',
+          enum: ['queue', 'steer'],
+          description:
+            'delivery: "queue" (default) waits for the running turn to finish, "steer" interrupts it and inserts this message now.',
+        },
       },
       required: ['worker', 'message'],
       additionalProperties: false,
@@ -590,6 +610,7 @@ async function callTool(id, params, api, signal) {
               from: args.from,
               cwd: args.cwd,
               workspace: args.workspace === true || (typeof args.workspace === 'string' && args.workspace !== '') ? args.workspace : undefined,
+              mode: args.mode === 'steer' ? 'steer' : undefined,
               model: typeof args.model === 'string' && args.model !== '' ? args.model : undefined,
               reasoningEffort:
                 typeof args.reasoningEffort === 'string' && args.reasoningEffort !== '' ? args.reasoningEffort : undefined,
@@ -606,6 +627,7 @@ async function callTool(id, params, api, signal) {
             await api.followup({
               worker,
               message,
+              mode: args.mode === 'steer' ? 'steer' : undefined,
               model: typeof args.model === 'string' && args.model !== '' ? args.model : undefined,
               reasoningEffort:
                 typeof args.reasoningEffort === 'string' && args.reasoningEffort !== '' ? args.reasoningEffort : undefined,
@@ -644,6 +666,7 @@ async function callTool(id, params, api, signal) {
               sessionId,
               agentPreset: typeof args.agentPreset === 'string' && args.agentPreset !== '' ? args.agentPreset : undefined,
               workspace: args.workspace === true || (typeof args.workspace === 'string' && args.workspace !== '') ? args.workspace : undefined,
+              mode: args.mode === 'steer' ? 'steer' : undefined,
               model: typeof args.model === 'string' && args.model !== '' ? args.model : undefined,
               reasoningEffort:
                 typeof args.reasoningEffort === 'string' && args.reasoningEffort !== '' ? args.reasoningEffort : undefined,
@@ -718,7 +741,7 @@ export function createApi(ctx, state, settings) {
       })
     },
 
-    async spawn({ taskName, message, forkTurns, from, cwd, model, reasoningEffort, workspace }) {
+    async spawn({ taskName, message, forkTurns, from, cwd, model, reasoningEffort, workspace, mode }) {
       const service = controller()
       if (service === undefined || service === null) throw new Error('session controller is unavailable')
       if (state.workers.has(taskName)) throw new Error(`task_name ${JSON.stringify(taskName)} is already in use`)
@@ -750,7 +773,7 @@ export function createApi(ctx, state, settings) {
       const before = Number(sessions()?.get?.(sessionId)?.seq ?? 0)
       const requestId = randomUUID()
       const accepted = await service.prompt(
-        { sessionId, requestId, mode: 'queue', content: [{ type: 'text', text: message }] },
+        { sessionId, requestId, mode: mode === 'steer' ? 'steer' : 'queue', content: [{ type: 'text', text: message }] },
         AbortSignal.timeout(30000),
       )
       state.dispatched.add(sessionId)
@@ -775,7 +798,7 @@ export function createApi(ctx, state, settings) {
       }
     },
 
-    async followup({ worker, message, model, reasoningEffort }) {
+    async followup({ worker, message, model, reasoningEffort, mode }) {
       const target = resolveWorker(state, worker)
       if (target === undefined) throw new Error(`unknown worker ${JSON.stringify(worker)}`)
       const service = controller()
@@ -785,7 +808,7 @@ export function createApi(ctx, state, settings) {
       const before = Number(sessions()?.get?.(target.sessionId)?.seq ?? 0)
       const requestId = randomUUID()
       const accepted = await service.prompt(
-        { sessionId: target.sessionId, requestId, mode: 'queue', content: [{ type: 'text', text: message }] },
+        { sessionId: target.sessionId, requestId, mode: mode === 'steer' ? 'steer' : 'queue', content: [{ type: 'text', text: message }] },
         AbortSignal.timeout(30000),
       )
       state.baseline.set(target.sessionId, before)
@@ -824,7 +847,7 @@ export function createApi(ctx, state, settings) {
       return rows
     },
 
-    async task({ prompt, cwd, sessionId, agentPreset, timeoutSeconds, model, reasoningEffort, workspace }) {
+    async task({ prompt, cwd, sessionId, agentPreset, timeoutSeconds, model, reasoningEffort, workspace, mode }) {
       const service = controller()
       if (service === undefined || service === null) throw new Error('session controller is unavailable')
       const seconds = Math.min(
@@ -846,17 +869,20 @@ export function createApi(ctx, state, settings) {
         }
         if (typeof targetId !== 'string' || targetId === '') throw new Error('session controller did not return a session id')
         created = true
-      } else if (ctx.get('agents')?.get?.(targetId)?.status === 'running') {
-        throw new Error('that session is running; use dsh_dispatch plus dsh_read_result instead')
+      } else if (mode !== 'steer' && ctx.get('agents')?.get?.(targetId)?.status === 'running') {
+        /* Steering exists precisely to reach a running session; queueing into one would
+         * silently wait for a turn this call is not tracking. */
+        throw new Error('that session is running; pass mode:"steer" to interrupt it, or use dsh_dispatch plus dsh_read_result')
       }
 
       const appliedModel = await applyModelSpec(ctx, targetId, model, reasoningEffort)
+      const deliveryMode = mode === 'steer' ? 'steer' : 'queue'
       const turnBefore = lastTurn(ctx, targetId)
       const before = Number(sessions()?.get?.(targetId)?.seq ?? 0)
       const finished = waitForTurnEnd(ctx, targetId, turnBefore, seconds * 1000)
       const requestId = randomUUID()
       const accepted = await service.prompt(
-        { sessionId: targetId, requestId, mode: 'queue', content: [{ type: 'text', text: prompt }] },
+        { sessionId: targetId, requestId, mode: deliveryMode, content: [{ type: 'text', text: prompt }] },
         AbortSignal.timeout(30000),
       )
       state.dispatched.add(targetId)
@@ -895,6 +921,7 @@ export function createApi(ctx, state, settings) {
           : {}),
         ...(appliedModel === undefined ? {} : { model: appliedModel }),
         ...(placed === undefined ? {} : { workspace: placed }),
+        mode: deliveryMode,
         text: collected.text,
         truncated: collected.truncated,
         turns: lastTurn(ctx, targetId),

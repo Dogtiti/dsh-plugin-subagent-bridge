@@ -56,6 +56,26 @@ dsh_task({ prompt: "…", cwd: "/repo/clawer" })
 - 返回结果里带上 `workspace: { id, title, path }`，方便确认落在哪个项目；
 - 项目操作失败不影响派发本身（分组是外观，不因此让任务失败）。
 
+## 排队还是立刻打断（`mode`）
+
+DSH 的 prompt 有两种投递模式，桥把它们交给调用方选：
+
+| `mode` | 行为 |
+| --- | --- |
+| `queue`（默认） | 等当前回合跑完再处理这条消息 |
+| `steer` | **立刻打断**当前回合，把这条消息插进去 |
+
+`dsh_task`、`dsh_spawn`、`dsh_followup` 都支持：
+
+```js
+dsh_followup({ worker: "w1", message: "别改了，先把现在的结果汇报一下", mode: "steer" })
+dsh_task({ sessionId: "session-…", prompt: "停一下，改成只跑单测", mode: "steer" })
+```
+
+和 `dsh_dispatch` 的关系：`dsh_dispatch` 一直有 `mode`，但它只投递、不等待；`dsh_task` 会阻塞到回合结束，所以以前对正在运行的会话直接拒绝。现在传 `mode: "steer"` 就允许插进运行中的会话——**它会先打断当前回合**，然后这个新回合跑完才返回。
+
+返回里带 `mode` 字段，方便确认这次是排队还是打断。
+
 ## 指定模型
 
 `dsh_task`、`dsh_spawn`、`dsh_followup` 都可以带 `model`，让 worker 跑在指定模型上：

@@ -381,7 +381,7 @@ function taskHost(options = {}) {
     },
     get(name) {
       if (name === 'sessions') return { get: (id) => (id === 'session-worker' ? session : undefined) }
-      if (name === 'agents') return { get: () => ({ status: 'idle' }) }
+      if (name === 'agents') return { get: () => ({ status: options.agentStatus ?? 'idle' }) }
       if (name === 'workspaceRegistry') {
         return {
           resolveByPath: async (path) => (options.workspaceByPath?.[path] ?? undefined),
@@ -464,7 +464,7 @@ test('dsh_task delivers only the final answer, not the whole turn', async () => 
     },
     get(name) {
       if (name === 'sessions') return { get: (id) => (id === 'session-worker' ? session : undefined) }
-      if (name === 'agents') return { get: () => ({ status: 'idle' }) }
+      if (name === 'agents') return { get: () => ({ status: options.agentStatus ?? 'idle' }) }
       if (name === 'workspaceRegistry') {
         return {
           resolveByPath: async (path) => (options.workspaceByPath?.[path] ?? undefined),
@@ -597,7 +597,7 @@ function workerHost(options = {}) {
     },
     get(name) {
       if (name === 'sessions') return { get: (id) => sessions.get(id) }
-      if (name === 'agents') return { get: () => ({ status: 'idle' }) }
+      if (name === 'agents') return { get: () => ({ status: options.agentStatus ?? 'idle' }) }
       if (name === 'workspaceRegistry') {
         return {
           resolveByPath: async (path) => (options.workspaceByPath?.[path] ?? undefined),
@@ -640,7 +640,8 @@ function workerHost(options = {}) {
           },
           prompt: async (request) => {
             calls.prompt.push(request)
-            const session = sessions.get(request.sessionId)
+            /* A pre-existing session id must not fail the fake: only its agent is busy. */
+            const session = sessions.get(request.sessionId) ?? make(request.sessionId)
             const turn = calls.prompt.filter((call) => call.sessionId === request.sessionId).length
             const base = session.seq
             session.events.push({ seq: base + 1, type: 'turn/start', data: { turn } })
@@ -1119,4 +1120,34 @@ test('runClaude passes resume and model through to the CLI', async () => {
   }
   await runClaude({ bin: '/fake/claude', prompt: '接着做', resume: 'sid-9', model: 'sonnet', timeoutMs: 5000, spawnImpl })
   assert.deepEqual(seen.args, ['--resume', 'sid-9', '-p', '接着做', '--output-format', 'json', '--model', 'sonnet'])
+})
+
+test('dsh_task queues by default and steers when asked', async () => {
+  const queued = workerHost()
+  await queued.api.task({ prompt: 'x', cwd: '/tmp' })
+  assert.equal(queued.calls.prompt[0].mode, 'queue')
+
+  const steered = workerHost()
+  const result = await steered.api.task({ prompt: 'x', cwd: '/tmp', mode: 'steer' })
+  assert.equal(steered.calls.prompt[0].mode, 'steer')
+  assert.equal(result.mode, 'steer')
+})
+
+test('dsh_spawn and dsh_followup carry the mode through', async () => {
+  const { api, calls } = workerHost()
+  await api.spawn({ taskName: 'w', message: 'a', forkTurns: 'none', cwd: '/tmp', mode: 'steer' })
+  assert.equal(calls.prompt[0].mode, 'steer')
+  await api.followup({ worker: 'w', message: 'b', mode: 'steer' })
+  assert.equal(calls.prompt[1].mode, 'steer')
+})
+
+test('a running session is refused for queue but accepted for steer', async () => {
+  const busy = workerHost({ agentStatus: 'running' })
+  await assert.rejects(
+    () => busy.api.task({ prompt: 'x', sessionId: 'session-busy' }),
+    /that session is running; pass mode:"steer"/,
+  )
+  const busy2 = workerHost({ agentStatus: 'running' })
+  await busy2.api.task({ prompt: 'x', sessionId: 'session-busy', mode: 'steer' })
+  assert.equal(busy2.calls.prompt[0].mode, 'steer')
 })
