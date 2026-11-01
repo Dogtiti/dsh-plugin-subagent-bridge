@@ -690,7 +690,7 @@ function workerHost(options = {}) {
     codexBin: '/definitely/not/here/codex',
     codexTimeoutMs: 5000,
   })
-  return { api, calls, sessions, ctx }
+  return { api, calls, sessions, ctx, make }
 }
 
 test('dsh_spawn returns immediately and registers the worker', async () => {
@@ -1183,3 +1183,15 @@ test('steering into a running turn resolves on that turn, not a newer one', asyn
   assert.equal(host.calls.prompt[0].mode, 'steer')
 })
 
+
+test('a steered answer starts at the delivered message, not the turn start', async () => {
+  /* The turn is mid-task: it already produced assistant text before our message. A steered
+   * reply must not be confused with that earlier text when the turn later continues. */
+  const host = workerHost({ agentStatus: 'running', preloadTurn: 1 })
+  const session = host.make('session-running')
+  session.events.push({ seq: 2, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '原任务第 5 步的输出' }] } } })
+  session.seq = 2
+  const result = await host.api.task({ prompt: '只回复：插话被看到', sessionId: 'session-running', mode: 'steer', timeoutSeconds: 5 })
+  assert.equal(result.mode, 'steer')
+  assert.equal(result.text, '第1轮结果')
+})

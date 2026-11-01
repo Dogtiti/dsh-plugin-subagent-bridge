@@ -279,6 +279,26 @@ const TOOLS = [
 ]
 
 /**
+ * Sequence number of the first message the caller itself delivered after `sinceSeq`.
+ * With steer the reply shares the running turn, so "the last assistant text of the turn"
+ * can be a step of the original task; anchoring on our own message keeps it exact.
+ * @param ctx - Host context.
+ * @param sessionId - session to read.
+ * @param sinceSeq - sequence captured before the prompt was delivered.
+ * @returns the sequence, or the original value when nothing matches.
+ */
+function firstDeliveredMessageSeq(ctx, sessionId, sinceSeq) {
+  const session = ctx.get('sessions')?.get?.(sessionId)
+  if (session === undefined || session === null) return sinceSeq
+  for (const event of session.snapshotEvents()) {
+    if (Number(event.seq) <= sinceSeq) continue
+    if (event.type !== 'user/message') continue
+    return Number(event.seq)
+  }
+  return sinceSeq
+}
+
+/**
  * Start the bridge.
  * @param ctx - Host context.
  * @param config - row configuration from the bundle patch.
@@ -908,7 +928,10 @@ export function createApi(ctx, state, settings) {
       }
 
       const end = await finished
-      const collected = finalAnswer(ctx, targetId, before, settings)
+      /* A steered reply lives inside the turn that was already running, so anchor the
+       * answer on the message we delivered instead of the turn's last assistant text. */
+      const answerFrom = deliveryMode === 'steer' ? firstDeliveredMessageSeq(ctx, targetId, before) : before
+      const collected = finalAnswer(ctx, targetId, answerFrom, settings)
       const turnReason = end?.reason?.kind ?? null
       const durationMs = Date.now() - started
       const status = end === undefined ? 'timeout' : turnReason === 'completed' ? 'completed' : `turn-${String(turnReason)}`
