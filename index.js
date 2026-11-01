@@ -75,6 +75,7 @@ const DEFAULTS = {
   codexBin: 'codex',
   codexSandbox: 'workspace-write',
   codexTimeoutMs: 300000,
+  assumeDefaults: true,
   claudeBin: 'claude',
   claudeModel: '',
   claudeTimeoutMs: 300000,
@@ -308,6 +309,28 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
 ]
+
+/**
+ * Standing instruction appended to a delegated task.
+ *
+ * A worker that stops to ask a question needs somebody at the UI; when the caller is
+ * another agent, nobody is. The caller would rather have a reasonable assumption and a
+ * finished result, so the worker is told to make one and report it.
+ */
+const ASSUMPTION_POLICY =
+  '如果缺少必要信息或需要在多个方案里选择，直接采用最合理的默认做法继续做完，不要把选择权抛回给用户、不要调用 ask_user_question 等回答；在结果里用一行说明你假设了什么。'
+
+/**
+ * Attach the standing instruction when the deployment wants it.
+ * @param settings - resolved settings.
+ * @param message - caller-supplied text.
+ * @returns the text to deliver.
+ */
+function withAssumptionPolicy(settings, message) {
+  if (settings.assumeDefaults !== true) return message
+  if (message.includes('ask_user_question')) return message
+  return `${message}\n\n（${ASSUMPTION_POLICY}）`
+}
 
 /**
  * Take over the questions a worker asks, so the calling agent can answer them.
@@ -965,7 +988,7 @@ export function createApi(ctx, state, settings) {
       const before = Number(sessions()?.get?.(sessionId)?.seq ?? 0)
       const requestId = randomUUID()
       const accepted = await service.prompt(
-        { sessionId, requestId, mode: mode === 'steer' ? 'steer' : 'queue', content: [{ type: 'text', text: message }] },
+        { sessionId, requestId, mode: mode === 'steer' ? 'steer' : 'queue', content: [{ type: 'text', text: withAssumptionPolicy(settings, message) }] },
         AbortSignal.timeout(30000),
       )
       state.dispatched.add(sessionId)
@@ -1000,7 +1023,7 @@ export function createApi(ctx, state, settings) {
       const before = Number(sessions()?.get?.(target.sessionId)?.seq ?? 0)
       const requestId = randomUUID()
       const accepted = await service.prompt(
-        { sessionId: target.sessionId, requestId, mode: mode === 'steer' ? 'steer' : 'queue', content: [{ type: 'text', text: message }] },
+        { sessionId: target.sessionId, requestId, mode: mode === 'steer' ? 'steer' : 'queue', content: [{ type: 'text', text: withAssumptionPolicy(settings, message) }] },
         AbortSignal.timeout(30000),
       )
       state.baseline.set(target.sessionId, before)
@@ -1079,7 +1102,7 @@ export function createApi(ctx, state, settings) {
       const finished = waitForTurnEnd(ctx, targetId, waitAfter, seconds * 1000)
       const requestId = randomUUID()
       const accepted = await service.prompt(
-        { sessionId: targetId, requestId, mode: deliveryMode, content: [{ type: 'text', text: prompt }] },
+        { sessionId: targetId, requestId, mode: deliveryMode, content: [{ type: 'text', text: withAssumptionPolicy(settings, prompt) }] },
         AbortSignal.timeout(30000),
       )
       state.dispatched.add(targetId)
@@ -2309,6 +2332,10 @@ function resolveSettings(config) {
     }
     if (key === 'codexBin' && typeof value === 'string' && value !== '') merged.codexBin = value
     if (key === 'codexSandbox' && typeof value === 'string' && value !== '') merged.codexSandbox = value
+    if (key === 'assumeDefaults') {
+      merged.assumeDefaults = value === true || value === 'true'
+      continue
+    }
     if (key === 'claudeBin' && typeof value === 'string' && value !== '') merged.claudeBin = value
     if (key === 'claudeModel' && typeof value === 'string') merged.claudeModel = value
     if (key === 'workersFile' && typeof value === 'string' && value !== '') merged.workersFile = expandHome(value)

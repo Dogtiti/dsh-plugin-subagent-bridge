@@ -724,6 +724,7 @@ function workerHost(options = {}) {
     dispatchPerMinute: options.dispatchPerMinute ?? 1000,
     dispatchWindowMs: options.dispatchWindowMs ?? 60000,
     codexBin: '/definitely/not/here/codex',
+    assumeDefaults: options.assumeDefaults ?? true,
     codexTimeoutMs: 5000,
   })
   return { api, calls, sessions, ctx, make, state }
@@ -1316,4 +1317,22 @@ test('an open question is answered through the waterfall waiter, not the continu
   assert.equal(result.answered, true)
   assert.deepEqual(resolved, { answers: [{ id: 'q1', selected: ['A'] }] })
   assert.equal(state.openQuestions.has('session-open'), false)
+})
+
+test('delegated tasks carry the standing assumption policy', async () => {
+  const { api, calls } = workerHost()
+  await api.task({ prompt: '整理一下这个仓库', cwd: '/tmp' })
+  const delivered = calls.prompt[0].content[0].text
+  assert.match(delivered, /直接采用最合理的默认做法继续做完/)
+  assert.match(delivered, /不要调用 ask_user_question/)
+
+  const off = workerHost({ assumeDefaults: false })
+  await off.api.task({ prompt: '整理一下这个仓库', cwd: '/tmp' })
+  assert.equal(off.calls.prompt[0].content[0].text, '整理一下这个仓库')
+})
+
+test('a prompt that already talks about asking is left alone', async () => {
+  const { api, calls } = workerHost()
+  await api.task({ prompt: '不要用 ask_user_question，直接决定', cwd: '/tmp' })
+  assert.equal(calls.prompt[0].content[0].text, '不要用 ask_user_question，直接决定')
 })

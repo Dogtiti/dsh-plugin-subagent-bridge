@@ -56,6 +56,24 @@ dsh_task({ prompt: "…", cwd: "/repo/clawer" })
 - 返回结果里带上 `workspace: { id, title, path }`，方便确认落在哪个项目；
 - 项目操作失败不影响派发本身（分组是外观，不因此让任务失败）。
 
+## 没人值守：让它自己拿主意（`assumeDefaults`）
+
+worker 卡在 `ask_user_question` 上时，需要有人在界面上点一下；但调用方是另一个 agent 时，那个人往往不在。
+
+所以桥在派发时会**自动追加一条常驻指令**：
+
+```
+（如果缺少必要信息或需要在多个方案里选择，直接采用最合理的默认做法继续做完，
+  不要把选择权抛回给用户、不要调用 ask_user_question 等回答；
+  在结果里用一行说明你假设了什么。）
+```
+
+- 默认开启，配置项 `assumeDefaults: false` 可关掉；
+- `dsh_task`、`dsh_spawn`、`dsh_followup` 三条路径都会加；
+- prompt 里本来就提到 `ask_user_question` 时不追加，避免和调用方的明确意图打架。
+
+效果：worker 不会停下来等人，而是选一个合理默认做法做完，并在结果里交代假设，调用方据此复核。
+
 ## 回答 worker 的问题（`dsh_answer`）
 
 worker 需要用户拍板时会调用 `ask_user_question`，然后**卡在那里等**。如果人不在，任务就停住了。
