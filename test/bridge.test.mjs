@@ -392,7 +392,7 @@ function taskHost(options = {}) {
     },
     get(name) {
       if (name === 'sessions') return { get: (id) => (id === 'session-worker' ? session : undefined) }
-      if (name === 'agents') return { get: () => ({ status: options.agentStatus ?? 'idle' }) }
+      if (name === 'agents') return { get: () => ({ status: 'idle' }) }
       if (name === 'workspaceRegistry') {
         return {
           resolveByPath: async (path) => (options.workspaceByPath?.[path] ?? undefined),
@@ -483,7 +483,7 @@ test('dsh_task delivers only the final answer, not the whole turn', async () => 
     },
     get(name) {
       if (name === 'sessions') return { get: (id) => (id === 'session-worker' ? session : undefined) }
-      if (name === 'agents') return { get: () => ({ status: options.agentStatus ?? 'idle' }) }
+      if (name === 'agents') return { get: () => ({ status: 'idle' }) }
       if (name === 'workspaceRegistry') {
         return {
           resolveByPath: async (path) => (options.workspaceByPath?.[path] ?? undefined),
@@ -714,7 +714,8 @@ function workerHost(options = {}) {
       return undefined
     },
   }
-  const api = createApi(ctx, { dispatched: new Set() }, {
+  const state = { dispatched: new Set(), openQuestions: new Map(), questionAnswerers: new Map() }
+  const api = createApi(ctx, state, {
     maxResultChars: 1000,
     maxWorkers: options.maxWorkers ?? 4,
     maxWorkersPerRoot: options.maxWorkersPerRoot ?? 4,
@@ -725,7 +726,7 @@ function workerHost(options = {}) {
     codexBin: '/definitely/not/here/codex',
     codexTimeoutMs: 5000,
   })
-  return { api, calls, sessions, ctx, make }
+  return { api, calls, sessions, ctx, make, state }
 }
 
 test('dsh_spawn returns immediately and registers the worker', async () => {
@@ -1287,4 +1288,32 @@ test('an answered question is no longer pending', async () => {
   session.seq = 4
   assert.equal(pendingQuestion(host.ctx, 'session-done'), undefined)
   await assert.rejects(() => host.api.answer({ worker: 'session-done', answers: [{ id: 'q', selected: [] }] }), /not waiting on a question/)
+})
+
+test('an open question is answered through the waterfall waiter, not the continued API', async () => {
+  const host = workerHost({ agentStatus: 'running' })
+  const state = host.state
+  const questions = [{ id: 'q1', question: '选哪个？', options: [{ label: 'A' }, { label: 'B' }] }]
+  let resolved
+  const waiter = {
+    questions,
+    settle: (answer) => {
+      state.openQuestions.delete('session-open')
+      resolved = answer
+    },
+    fail: () => {
+      resolved = { failed: true }
+    },
+    cleanup: () => {},
+  }
+  state.openQuestions.set('session-open', waiter)
+
+  const asked = pendingQuestion(host.ctx, 'session-open', state)
+  assert.equal(asked.callId, 'open:session-open')
+  assert.equal(asked.questions[0].options.length, 2)
+
+  const result = await host.api.answer({ worker: 'session-open', answers: [{ id: 'q1', selected: ['A'] }] })
+  assert.equal(result.answered, true)
+  assert.deepEqual(resolved, { answers: [{ id: 'q1', selected: ['A'] }] })
+  assert.equal(state.openQuestions.has('session-open'), false)
 })

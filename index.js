@@ -310,6 +310,57 @@ const TOOLS = [
 ]
 
 /**
+ * Take over the questions a worker asks, so the calling agent can answer them.
+ *
+ * `ask_user_question` pauses the tool call until something answers on the
+ * `user-questions/request` waterfall. The Web UI answers from the browser; for a worker
+ * nobody is watching, the bridge answers instead and forwards the question to its caller.
+ * @param state - bridge state.
+ * @param agent - live agent of the worker session.
+ */
+function attachQuestionAnswerer(state, agent) {
+  if (agent?.ctx === undefined || typeof agent.ctx.on !== 'function') return
+  state.openQuestions ??= new Map()
+  state.questionAnswerers ??= new Map()
+  const sessionId = String(agent.id)
+  if (state.questionAnswerers.has(sessionId)) return
+  const handler = (request, next) => {
+    const questions = Array.isArray(request?.questions) ? request.questions : []
+    if (questions.length === 0) return next()
+    return new Promise((resolve, reject) => {
+      const waiter = {
+        questions,
+        settle(answer) {
+          state.openQuestions.delete(sessionId)
+          waiter.cleanup()
+          resolve(answer)
+        },
+        fail(error) {
+          state.openQuestions.delete(sessionId)
+          waiter.cleanup()
+          reject(error)
+        },
+      }
+      const signal = request?.signal
+      const onAbort = () => waiter.fail(new Error('the question was withdrawn'))
+      waiter.cleanup = () => signal?.removeEventListener?.('abort', onAbort)
+      if (signal?.aborted === true) {
+        waiter.fail(new Error('the question was withdrawn'))
+        return
+      }
+      signal?.addEventListener?.('abort', onAbort)
+      state.openQuestions.set(sessionId, waiter)
+    })
+  }
+  try {
+    const off = agent.ctx.on('user-questions/request', handler)
+    state.questionAnswerers.set(sessionId, typeof off === 'function' ? off : () => {})
+  } catch {
+    /* An older Host without the waterfall: the continued-state path still works. */
+  }
+}
+
+/**
  * The question a worker is currently blocked on, if any.
  * `ask_user_question` records a tool call and waits for an answer; while it waits the call
  * has no result yet, which is exactly the signal used here.
@@ -321,13 +372,33 @@ function askable(state, ctx, targets) {
   for (const target of targets) {
     const resolved = resolveWorker(state, target)
     const sessionId = resolved === undefined ? target : resolved.sessionId
-    const asked = pendingQuestion(ctx, sessionId)
+    const asked = pendingQuestion(ctx, sessionId, state)
     if (asked !== undefined) return { worker: target, ...asked }
   }
   return undefined
 }
 
-export function pendingQuestion(ctx, sessionId) {
+export function pendingQuestion(ctx, sessionId, state) {
+  const open = state?.openQuestions?.get(sessionId)
+  if (open !== undefined) {
+    return {
+      callId: `open:${sessionId}`,
+      questions: open.questions.map((question) => ({
+        id: String(question?.id ?? ''),
+        question: String(question?.question ?? ''),
+        ...(typeof question?.header === 'string' ? { header: question.header } : {}),
+        ...(question?.multiSelect === true ? { multiSelect: true } : {}),
+        ...(Array.isArray(question?.options)
+          ? {
+              options: question.options.map((option) => ({
+                label: String(option?.label ?? ''),
+                ...(typeof option?.description === 'string' ? { description: option.description } : {}),
+              })),
+            }
+          : {}),
+      })),
+    }
+  }
   const session = ctx.get('sessions')?.get?.(sessionId)
   if (session === undefined || session === null) return undefined
   const settled = new Set()
@@ -393,7 +464,7 @@ export function apply(ctx, config = {}) {
   const settings = resolveSettings(config)
   if (settings.enabled !== true) return
 
-  const state = { dispatched: new Set(), children: new Set() }
+  const state = { dispatched: new Set(), children: new Set(), openQuestions: new Map(), questionAnswerers: new Map() }
   const api = createApi(ctx, state, settings)
   let bridge
 
@@ -890,6 +961,7 @@ export function createApi(ctx, state, settings) {
       }
 
       const appliedModel = await applyModelSpec(ctx, sessionId, model, reasoningEffort)
+      attachQuestionAnswerer(state, ctx.get('agents')?.get?.(sessionId))
       const before = Number(sessions()?.get?.(sessionId)?.seq ?? 0)
       const requestId = randomUUID()
       const accepted = await service.prompt(
@@ -998,6 +1070,7 @@ export function createApi(ctx, state, settings) {
       const appliedModel = await applyModelSpec(ctx, targetId, model, reasoningEffort)
       /* DSH delivers a prompt either queued behind the running turn or steered into it. */
       const deliveryMode = mode === 'steer' ? 'steer' : 'queue'
+      attachQuestionAnswerer(state, ctx.get('agents')?.get?.(targetId))
       const turnBefore = lastTurn(ctx, targetId)
       /* A steered message is absorbed by the turn that is already running, so waiting for
        * a strictly newer turn would hang until the timeout even after the answer landed. */
@@ -1104,7 +1177,13 @@ export function createApi(ctx, state, settings) {
     async answer({ worker, sessionId, answers }) {
       const target = worker === undefined ? sessionId : (resolveWorker(state, worker)?.sessionId ?? worker)
       if (typeof target !== 'string' || target === '') throw new Error('name a worker or a sessionId')
-      const asked = pendingQuestion(ctx, target)
+      const open = state.openQuestions?.get(target)
+      if (open !== undefined) {
+        /* The tool call is still blocked, so hand the batch straight to its waiter. */
+        open.settle({ answers })
+        return { answered: true, callId: `open:${target}`, sessionId: target }
+      }
+      const asked = pendingQuestion(ctx, target, state)
       if (asked === undefined) throw new Error('that worker is not waiting on a question')
       const service = ctx.get('userQuestions')
       const agent = ctx.get('agents')?.get?.(target)
