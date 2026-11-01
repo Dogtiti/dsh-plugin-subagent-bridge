@@ -269,14 +269,14 @@ dsh-plugin-subagent-bridge（宿主进程内）
 | Skill | 装给谁 | 作用 |
 | --- | --- | --- |
 | `deepseek-worker` | Codex | 让 Codex 把任务当 subagent 派给 DSH（`dsh_task`），一次调用等结果 |
-| `delegate-to-codex` | DSH | 让 DSH 的 agent 在需要独立视角/复核时派给 Codex（`codex_dispatch`） |
+| `delegate-to-external-agent` | DSH | 让 DSH 的 agent 在需要独立视角/复核时派给外部 agent：Codex（`codex_dispatch`）或 Claude Code（`claude_dispatch`），含两者的差别与续接方式 |
 
 ```bash
 # Codex 侧
 mkdir -p ~/.codex/skills && cp -R skills/deepseek-worker ~/.codex/skills/
 
 # DSH 侧
-mkdir -p ~/.dsh/skills && cp -R skills/delegate-to-codex ~/.dsh/skills/
+mkdir -p ~/.dsh/skills && cp -R skills/delegate-to-external-agent ~/.dsh/skills/
 ```
 
 两份都是标准 `SKILL.md`：YAML frontmatter（`name` + `description`）+ 正文。**触发靠 description**——模型平时只看到名字和描述，判断相关了才读正文，所以描述里写满了中英触发语和"不要用"的边界。改完立刻生效，不用重启：Codex 下一次会话、DSH 下一轮就能看到。
