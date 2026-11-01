@@ -305,6 +305,23 @@ mkdir -p ~/.dsh/skills  && cp -R skills/delegate-to-external-agent ~/.dsh/skills
 node --test "test/*.test.mjs"
 ```
 
+```
+index.js              wiring: apply() + re-exports
+src/constants.js      versions, limits, binary candidates, policy text
+src/utils.js          JSON-RPC helpers, argument validation, sleep
+src/settings.js       defaults and config resolution
+src/tools.js          tool schemas
+src/policy.js         the standing instruction
+src/questions.js      ask_user_question takeover and reporting
+src/sessions.js       session reads, waits, model and workspace placement
+src/guards.js         depth and rate limits
+src/registry.js       worker registry persistence and capacity
+src/http.js           loopback server, JSON-RPC, tool dispatch
+src/api.js            the bridge API the tools call
+src/runners/codex.js  codex exec adapter
+src/runners/claude.js claude -p adapter
+```
+
 83 项测试：握手与版本协商、工具清单与参数校验、派发调用形状、结果基线、长轮询、真实 HTTP 往返（404/405/202 与 bearer）、`codex exec` 事件解析、二进制解析、成功/失败/超时、resume 参数分叉、只回最终回答、`dsh_wait` 终态、名额上限与释放、followup 重基线、注册表持久化与重启恢复、`maxHops` 与速率限制、按 `cwd` 的预算、项目创建与复用、`queue`/`steer` 投递与等待、插话回答的锚点、Claude 输出解析与 resume 参数、`assumeDefaults` 注入、`pendingQuestion` 与 `dsh_answer`。
 
 ## 相关插件

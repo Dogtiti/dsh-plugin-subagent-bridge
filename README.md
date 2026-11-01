@@ -307,6 +307,23 @@ Both are plain `SKILL.md` files: YAML frontmatter (`name` + `description`) plus 
 node --test "test/*.test.mjs"
 ```
 
+```
+index.js              wiring: apply() + re-exports
+src/constants.js      versions, limits, binary candidates, policy text
+src/utils.js          JSON-RPC helpers, argument validation, sleep
+src/settings.js       defaults and config resolution
+src/tools.js          tool schemas
+src/policy.js         the standing instruction
+src/questions.js      ask_user_question takeover and reporting
+src/sessions.js       session reads, waits, model and workspace placement
+src/guards.js         depth and rate limits
+src/registry.js       worker registry persistence and capacity
+src/http.js           loopback server, JSON-RPC, tool dispatch
+src/api.js            the bridge API the tools call
+src/runners/codex.js  codex exec adapter
+src/runners/claude.js claude -p adapter
+```
+
 83 tests: handshake and version negotiation, tool list and argument validation, dispatch call shape, result baselines, long polling, real HTTP round trips (404/405/202 and bearer), `codex exec` event parsing, binary resolution, success/failure/timeout runs, resume argument split, final-answer-only behaviour, `dsh_wait` terminal states, slot limits and release, followup rebaselining, registry persistence and restart recovery, `maxHops` and rate limiting, per-`cwd` budgets, workspace creation and reuse, `queue`/`steer` delivery and waiting, anchors for steered answers, Claude output parsing and resume arguments, `assumeDefaults` injection, `pendingQuestion` and `dsh_answer`.
 
 ## Related
