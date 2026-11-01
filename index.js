@@ -208,6 +208,37 @@ const TOOLS = [
     },
   },
   {
+    name: 'dsh_answer',
+    description:
+      'Answer a question a worker is blocked on (ask_user_question) on the user behalf. dsh_wait reports such a question as pendingQuestion; every question id in it must appear exactly once in answers.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        worker: { type: 'string', description: 'task_name or session id of the blocked worker.' },
+        answers: {
+          type: 'array',
+          description: 'One entry per pending question.',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', description: 'Question id, copied from pendingQuestion.' },
+              selected: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Chosen option labels; empty when the question is being skipped.',
+              },
+              custom: { type: 'string', description: 'Free-form answer when no option fits.' },
+            },
+            required: ['id', 'selected'],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ['worker', 'answers'],
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'dsh_list_workers',
     description: 'List the workers this bridge started, with their task_name, session id, and live status.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
@@ -277,6 +308,61 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
 ]
+
+/**
+ * The question a worker is currently blocked on, if any.
+ * `ask_user_question` records a tool call and waits for an answer; while it waits the call
+ * has no result yet, which is exactly the signal used here.
+ * @param ctx - Host context.
+ * @param sessionId - session to inspect.
+ * @returns the pending call and its questions, or undefined.
+ */
+function askable(state, ctx, targets) {
+  for (const target of targets) {
+    const resolved = resolveWorker(state, target)
+    const sessionId = resolved === undefined ? target : resolved.sessionId
+    const asked = pendingQuestion(ctx, sessionId)
+    if (asked !== undefined) return { worker: target, ...asked }
+  }
+  return undefined
+}
+
+export function pendingQuestion(ctx, sessionId) {
+  const session = ctx.get('sessions')?.get?.(sessionId)
+  if (session === undefined || session === null) return undefined
+  const settled = new Set()
+  let waiting
+  for (const event of session.snapshotEvents()) {
+    if (event.type === 'tool/result' && typeof event.data?.callId === 'string') settled.add(event.data.callId)
+    if (event.type === 'tool/call' && event.data?.name === 'ask_user_question') waiting = event.data
+  }
+  if (waiting === undefined || settled.has(waiting.callId)) return undefined
+  let parsed
+  try {
+    parsed = JSON.parse(typeof waiting.arguments === 'string' ? waiting.arguments : '{}')
+  } catch {
+    return undefined
+  }
+  const questions = Array.isArray(parsed?.questions) ? parsed.questions : []
+  if (questions.length === 0) return undefined
+  return {
+    callId: String(waiting.callId),
+    questions: questions.map((question) => ({
+      id: String(question?.id ?? ''),
+      question: String(question?.question ?? ''),
+      ...(typeof question?.header === 'string' ? { header: question.header } : {}),
+      ...(question?.multi_select === true ? { multiSelect: true } : {}),
+      ...(Array.isArray(question?.options)
+        ? {
+            options: question.options.map((option) => ({
+              label: String(option?.label ?? ''),
+              ...(typeof option?.description === 'string' ? { description: option.description } : {}),
+            })),
+          }
+        : {}),
+    })),
+  }
+}
 
 /**
  * Sequence number of the first message the caller itself delivered after `sinceSeq`.
@@ -659,6 +745,20 @@ async function callTool(id, params, api, signal) {
         const worker = requireString(args.worker, 'worker')
         return ok(id, text(await api.close({ worker })))
       }
+      case 'dsh_answer': {
+        const worker = requireString(args.worker, 'worker')
+        if (!Array.isArray(args.answers) || args.answers.length === 0) throw new Error('answers must be a non-empty array')
+        const answers = args.answers.map((entry, index) => {
+          const questionId = requireString(entry?.id, `answers[${index}].id`)
+          if (!Array.isArray(entry?.selected)) throw new Error(`answers[${index}].selected must be an array`)
+          return {
+            id: questionId,
+            selected: entry.selected.map((label, at) => requireString(label, `answers[${index}].selected[${at}]`)),
+            ...(typeof entry.custom === 'string' && entry.custom !== '' ? { custom: entry.custom } : {}),
+          }
+        })
+        return ok(id, text(await api.answer({ worker, answers })))
+      }
       case 'dsh_list_workers':
         return ok(id, text(await api.listWorkers()))
       case 'dsh_wait': {
@@ -977,23 +1077,42 @@ export function createApi(ctx, state, settings) {
           if (typeof value !== 'string' || final) settled = true
         }
         const waitedMs = Date.now() - started
-        if (settled) return { status, timedOut: false, waitedMs }
+        const asked = askable(state, ctx, targets)
+        if (settled) return { status, timedOut: false, waitedMs, ...(asked === undefined ? {} : { pendingQuestion: asked }) }
         if (waitedMs >= budget) {
           const still = targets.filter((target) => status[target] === 'running' || status[target] === 'pending')
           return {
             status,
             timedOut: true,
             waitedMs,
+            ...(asked === undefined ? {} : { pendingQuestion: asked }),
             ...(still.length === 0
               ? {}
               : {
                   running: true,
-                  next: `still running: ${still.join(', ')}; call dsh_wait again with the same targets until none of them are "running"`,
+                  next:
+                    asked === undefined
+                      ? `still running: ${still.join(', ')}; call dsh_wait again with the same targets until none of them are "running"`
+                      : `blocked on a question: answer it with dsh_answer, or call dsh_wait again`,
                 }),
           }
         }
         await sleep(Math.min(300, budget - waitedMs))
       }
+    },
+
+    async answer({ worker, sessionId, answers }) {
+      const target = worker === undefined ? sessionId : (resolveWorker(state, worker)?.sessionId ?? worker)
+      if (typeof target !== 'string' || target === '') throw new Error('name a worker or a sessionId')
+      const asked = pendingQuestion(ctx, target)
+      if (asked === undefined) throw new Error('that worker is not waiting on a question')
+      const service = ctx.get('userQuestions')
+      const agent = ctx.get('agents')?.get?.(target)
+      if (service === undefined || service === null || agent === undefined) {
+        throw new Error('the question service is unavailable')
+      }
+      const accepted = service.answer(agent, asked.callId, { answers })
+      return { answered: accepted === true, callId: asked.callId, sessionId: target }
     },
 
     async dispatch({ sessionId, text, mode }) {

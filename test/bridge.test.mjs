@@ -3,7 +3,7 @@ import test from 'node:test'
 
 import { EventEmitter } from 'node:events'
 
-import { createApi, createBridgeServer, handleJsonRpc, parseCodexOutput, resolveCodex, runCodex, parseClaudeOutput, runClaude } from '../index.js'
+import { createApi, createBridgeServer, handleJsonRpc, pendingQuestion, parseCodexOutput, resolveCodex, runCodex, parseClaudeOutput, runClaude } from '../index.js'
 
 const SESSION_ID = 'session-test'
 const TOKEN = 'k'.repeat(32)
@@ -86,7 +86,18 @@ test('answers notifications with nothing', async () => {
 test('lists the bridge tools', async () => {
   const { api } = apiUnderTest()
   const reply = await handleJsonRpc({ jsonrpc: '2.0', id: 2, method: 'tools/list' }, api)
-  assert.deepEqual(reply.result.tools.map((tool) => tool.name), ['dsh_task', 'dsh_spawn', 'dsh_followup', 'dsh_close', 'dsh_list_workers', 'dsh_dispatch', 'dsh_wait', 'dsh_read_result', 'dsh_list_sessions'])
+  assert.deepEqual(reply.result.tools.map((tool) => tool.name), [
+    'dsh_task',
+    'dsh_spawn',
+    'dsh_followup',
+    'dsh_close',
+    'dsh_answer',
+    'dsh_list_workers',
+    'dsh_dispatch',
+    'dsh_wait',
+    'dsh_read_result',
+    'dsh_list_sessions',
+  ])
   assert.deepEqual(reply.result.tools[0].inputSchema.required, ['prompt'])
   assert.match(reply.result.tools[0].description, /subagent/)
 })
@@ -169,7 +180,7 @@ test('serves JSON-RPC over HTTP with the capability token', async () => {
     })
     assert.equal(listed.status, 200)
     const reply = await listed.json()
-    assert.equal(reply.result.tools.length, 9)
+    assert.equal(reply.result.tools.length, 10)
 
     const notification = await fetch(bridge.url, {
       method: 'POST',
@@ -399,6 +410,14 @@ function taskHost(options = {}) {
           },
         }
       }
+      if (name === 'userQuestions') {
+        return {
+          answer: (agent, callId, payload) => {
+            calls.questionAnswers.push({ callId, answers: payload.answers })
+            return true
+          },
+        }
+      }
       if (name === 'agentDefaultModel') {
         return { currentSelection: () => options.defaultSelection ?? { provider: 'opencode-go', model: 'deepseek-v4.1-flash' } }
       }
@@ -479,6 +498,14 @@ test('dsh_task delivers only the final answer, not the whole turn', async () => 
             }
             calls.workspaceAttached.push(workspace)
             return workspace
+          },
+        }
+      }
+      if (name === 'userQuestions') {
+        return {
+          answer: (agent, callId, payload) => {
+            calls.questionAnswers.push({ callId, answers: payload.answers })
+            return true
           },
         }
       }
@@ -581,7 +608,7 @@ test('dsh_wait marks sessions this bridge never dispatched and reports errors', 
  * @returns an api plus the recorded calls.
  */
 function workerHost(options = {}) {
-  const calls = { create: [], fork: [], prompt: [], selectModel: [], workspaceCreate: [], workspaceAttached: [], cancel: [] }
+  const calls = { create: [], fork: [], prompt: [], selectModel: [], workspaceCreate: [], workspaceAttached: [], cancel: [], questionAnswers: [] }
   const sessions = new Map()
   const listeners = new Set()
   let counter = 0
@@ -616,6 +643,14 @@ function workerHost(options = {}) {
             }
             calls.workspaceAttached.push(workspace)
             return workspace
+          },
+        }
+      }
+      if (name === 'userQuestions') {
+        return {
+          answer: (agent, callId, payload) => {
+            calls.questionAnswers.push({ callId, answers: payload.answers })
+            return true
           },
         }
       }
@@ -1194,4 +1229,62 @@ test('a steered answer starts at the delivered message, not the turn start', asy
   const result = await host.api.task({ prompt: '只回复：插话被看到', sessionId: 'session-running', mode: 'steer', timeoutSeconds: 5 })
   assert.equal(result.mode, 'steer')
   assert.equal(result.text, '第1轮结果')
+})
+
+test('a worker blocked on ask_user_question reports the question, and answers reach the service', async () => {
+  const host = workerHost({ agentStatus: 'running' })
+  const session = host.make('session-asking')
+  session.events.push({
+    seq: 10,
+    type: 'tool/call',
+    data: {
+      turn: 1,
+      step: 1,
+      callId: 'call_abc',
+      name: 'ask_user_question',
+      arguments: JSON.stringify({
+        questions: [
+          {
+            id: 'mode',
+            question: '用哪种模式？',
+            header: 'Choose Mode',
+            options: [{ label: '快速', description: '只跑单测' }, { label: '完整' }],
+          },
+        ],
+      }),
+    },
+  })
+  session.seq = 10
+
+  const asked = pendingQuestion(host.ctx, 'session-asking')
+  assert.deepEqual(asked, {
+    callId: 'call_abc',
+    questions: [
+      {
+        id: 'mode',
+        question: '用哪种模式？',
+        header: 'Choose Mode',
+        options: [{ label: '快速', description: '只跑单测' }, { label: '完整' }],
+      },
+    ],
+  })
+
+  const result = await host.api.answer({ worker: 'session-asking', answers: [{ id: 'mode', selected: ['快速'] }] })
+  assert.equal(result.answered, true)
+  assert.equal(result.callId, 'call_abc')
+  assert.deepEqual(host.calls.questionAnswers, [{ callId: 'call_abc', answers: [{ id: 'mode', selected: ['快速'] }] }])
+})
+
+test('an answered question is no longer pending', async () => {
+  const host = workerHost({ agentStatus: 'idle' })
+  const session = host.make('session-done')
+  session.events.push({
+    seq: 3,
+    type: 'tool/call',
+    data: { callId: 'call_x', name: 'ask_user_question', arguments: JSON.stringify({ questions: [{ id: 'q', question: '?' }] }) },
+  })
+  session.events.push({ seq: 4, type: 'tool/result', data: { callId: 'call_x' } })
+  session.seq = 4
+  assert.equal(pendingQuestion(host.ctx, 'session-done'), undefined)
+  await assert.rejects(() => host.api.answer({ worker: 'session-done', answers: [{ id: 'q', selected: [] }] }), /not waiting on a question/)
 })

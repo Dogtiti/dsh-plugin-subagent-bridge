@@ -56,6 +56,48 @@ dsh_task({ prompt: "…", cwd: "/repo/clawer" })
 - 返回结果里带上 `workspace: { id, title, path }`，方便确认落在哪个项目；
 - 项目操作失败不影响派发本身（分组是外观，不因此让任务失败）。
 
+## 回答 worker 的问题（`dsh_answer`）
+
+worker 需要用户拍板时会调用 `ask_user_question`，然后**卡在那里等**。如果人不在，任务就停住了。
+
+桥把这种情况暴露出来：
+
+```jsonc
+// dsh_wait 的返回
+{
+  "status": { "w1": "running" },
+  "timedOut": true,
+  "pendingQuestion": {
+    "callId": "call_abc",
+    "questions": [
+      {
+        "id": "mode",
+        "question": "用哪种模式？",
+        "header": "Choose Mode",
+        "options": [{ "label": "快速", "description": "只跑单测" }, { "label": "完整" }]
+      }
+    ]
+  },
+  "next": "blocked on a question: answer it with dsh_answer, or call dsh_wait again"
+}
+```
+
+调用方（Codex / Claude）看到 `pendingQuestion` 就可以代用户回答：
+
+```jsonc
+dsh_answer({
+  "worker": "w1",
+  "answers": [{ "id": "mode", "selected": ["快速"] }]   // custom 可用于自由文本
+})
+```
+
+细节：
+
+- 一个问题的 id 必须**恰好出现一次**，否则底层会报 `BAD_ANSWER`；
+- `selected` 是选项 label 数组，多选时给多个；跳过一个问题就给空数组；
+- 回答是插进正在等待的那个回合的（底层用 `steer`），worker 立刻继续；
+- 只有真卡在 `ask_user_question` 上才算「等待中」——工具一旦返回结果就不再报。
+
 ## 排队还是插话（`mode`）
 
 DSH 的「繁忙时的发送行为」只有两种，桥把它们原样交给调用方：
