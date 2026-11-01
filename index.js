@@ -117,9 +117,9 @@ const TOOLS = [
         },
         mode: {
           type: 'string',
-          enum: ['queue', 'steer'],
+          enum: ['queue', 'steer', 'interrupt'],
           description:
-            'delivery: "queue" (default) waits for the running turn to finish, "steer" interrupts it and inserts this message now.',
+            'delivery: "queue" (default) waits for the running turn to finish; "steer" inserts the message into that turn (its current step still completes); "interrupt" cancels the running turn first, then sends.',
         },
 
         reasoningEffort: {
@@ -160,9 +160,9 @@ const TOOLS = [
         },
         mode: {
           type: 'string',
-          enum: ['queue', 'steer'],
+          enum: ['queue', 'steer', 'interrupt'],
           description:
-            'delivery: "queue" (default) waits for the running turn to finish, "steer" interrupts it and inserts this message now.',
+            'delivery: "queue" (default) waits for the running turn to finish; "steer" inserts the message into that turn (its current step still completes); "interrupt" cancels the running turn first, then sends.',
         },
 
         reasoningEffort: { type: 'string', description: 'Reasoning level for `model`, when that model offers levels.' },
@@ -187,9 +187,9 @@ const TOOLS = [
         reasoningEffort: { type: 'string', description: 'Reasoning level for `model`, when that model offers levels.' },
         mode: {
           type: 'string',
-          enum: ['queue', 'steer'],
+          enum: ['queue', 'steer', 'interrupt'],
           description:
-            'delivery: "queue" (default) waits for the running turn to finish, "steer" interrupts it and inserts this message now.',
+            'delivery: "queue" (default) waits for the running turn to finish; "steer" inserts the message into that turn (its current step still completes); "interrupt" cancels the running turn first, then sends.',
         },
       },
       required: ['worker', 'message'],
@@ -610,7 +610,7 @@ async function callTool(id, params, api, signal) {
               from: args.from,
               cwd: args.cwd,
               workspace: args.workspace === true || (typeof args.workspace === 'string' && args.workspace !== '') ? args.workspace : undefined,
-              mode: args.mode === 'steer' ? 'steer' : undefined,
+              mode: args.mode === 'steer' || args.mode === 'interrupt' ? args.mode : undefined,
               model: typeof args.model === 'string' && args.model !== '' ? args.model : undefined,
               reasoningEffort:
                 typeof args.reasoningEffort === 'string' && args.reasoningEffort !== '' ? args.reasoningEffort : undefined,
@@ -627,7 +627,7 @@ async function callTool(id, params, api, signal) {
             await api.followup({
               worker,
               message,
-              mode: args.mode === 'steer' ? 'steer' : undefined,
+              mode: args.mode === 'steer' || args.mode === 'interrupt' ? args.mode : undefined,
               model: typeof args.model === 'string' && args.model !== '' ? args.model : undefined,
               reasoningEffort:
                 typeof args.reasoningEffort === 'string' && args.reasoningEffort !== '' ? args.reasoningEffort : undefined,
@@ -666,7 +666,7 @@ async function callTool(id, params, api, signal) {
               sessionId,
               agentPreset: typeof args.agentPreset === 'string' && args.agentPreset !== '' ? args.agentPreset : undefined,
               workspace: args.workspace === true || (typeof args.workspace === 'string' && args.workspace !== '') ? args.workspace : undefined,
-              mode: args.mode === 'steer' ? 'steer' : undefined,
+              mode: args.mode === 'steer' || args.mode === 'interrupt' ? args.mode : undefined,
               model: typeof args.model === 'string' && args.model !== '' ? args.model : undefined,
               reasoningEffort:
                 typeof args.reasoningEffort === 'string' && args.reasoningEffort !== '' ? args.reasoningEffort : undefined,
@@ -869,15 +869,28 @@ export function createApi(ctx, state, settings) {
         }
         if (typeof targetId !== 'string' || targetId === '') throw new Error('session controller did not return a session id')
         created = true
-      } else if (mode !== 'steer' && ctx.get('agents')?.get?.(targetId)?.status === 'running') {
+      } else if (mode !== 'steer' && mode !== 'interrupt' && ctx.get('agents')?.get?.(targetId)?.status === 'running') {
         /* Steering exists precisely to reach a running session; queueing into one would
          * silently wait for a turn this call is not tracking. */
-        throw new Error('that session is running; pass mode:"steer" to interrupt it, or use dsh_dispatch plus dsh_read_result')
+        throw new Error('that session is running; pass mode:"steer" (insert into the turn) or mode:"interrupt" (cancel it first), or use dsh_dispatch plus dsh_read_result')
       }
 
       const appliedModel = await applyModelSpec(ctx, targetId, model, reasoningEffort)
-      const deliveryMode = mode === 'steer' ? 'steer' : 'queue'
+      const deliveryMode = mode === 'steer' ? 'steer' : mode === 'interrupt' ? 'interrupt' : 'queue'
       const turnBefore = lastTurn(ctx, targetId)
+
+      /* `steer` inserts the message into the running turn, but that turn still finishes its
+       * current step first — an in-flight tool call keeps running. `interrupt` is the hard
+       * stop: cancel the turn, then send, so the worker drops what it was doing. */
+      if (deliveryMode === 'interrupt' && ctx.get('agents')?.get?.(targetId)?.status === 'running') {
+        try {
+          await service.cancel({ sessionId: targetId })
+        } catch {
+          /* Cancelling is best effort: the send below still delivers the message. */
+        }
+        await waitForTurnEnd(ctx, targetId, turnBefore, 15000)
+      }
+
       /* A steered message is absorbed by the turn that is already running, so waiting for
        * a strictly newer turn would hang until the timeout even after the answer landed. */
       const waitAfter = deliveryMode === 'steer' ? Math.max(0, turnBefore - 1) : turnBefore
@@ -885,7 +898,7 @@ export function createApi(ctx, state, settings) {
       const finished = waitForTurnEnd(ctx, targetId, waitAfter, seconds * 1000)
       const requestId = randomUUID()
       const accepted = await service.prompt(
-        { sessionId: targetId, requestId, mode: deliveryMode, content: [{ type: 'text', text: prompt }] },
+        { sessionId: targetId, requestId, mode: deliveryMode === 'steer' ? 'steer' : 'queue', content: [{ type: 'text', text: prompt }] },
         AbortSignal.timeout(30000),
       )
       state.dispatched.add(targetId)
