@@ -224,6 +224,35 @@ dsh_followup({ "worker": "audit_api", "message": "把第 3 条展开，给出补
 
 `dsh_followup` 复用该 worker 的会话，比新开一个便宜。也可以用 `dsh_task({ "sessionId": …, "prompt": … })` 做同样的事（阻塞版）。
 
+## 改主意时：排队还是立刻打断
+
+默认 `dsh_followup` / `dsh_task` 是**排队**：等 worker 当前这一轮跑完再处理。但有时候用户就是要它立刻停——改方向、别继续跑、先汇报。这时用 `mode`：
+
+```jsonc
+// 排进队列，等当前回合结束（默认）
+dsh_followup({ "worker": "w1", "message": "跑完顺手看一下测试覆盖率" })
+
+// 插进当前回合：当前那一步工具调用仍会跑完
+dsh_followup({ "worker": "w1", "message": "补充一句：只改 src 下的文件", "mode": "steer" })
+
+// 立刻打断：先取消当前回合，再发消息开新回合
+dsh_followup({ "worker": "w1", "message": "停，先汇报现在的结果", "mode": "interrupt" })
+```
+
+| `mode` | 行为 | 什么时候用 |
+| --- | --- | --- |
+| `queue`（默认） | 等这一轮结束 | 补充要求，不急着停 |
+| `steer` | 并入当前回合，**当前那一步还会跑完** | 想到补充，能等这一下 |
+| `interrupt` | 先 `cancel`，再发消息 | 真的要停 |
+
+实测差别（worker 正在跑 `sleep 120`）：
+
+- `steer` → 消息要等那一步工具调用结束才被看到，**70 秒**才回应；
+- `interrupt` → 先 aborted 当前回合，再开新回合，**10 秒左右**返回。
+
+用户说「停下来」「别跑了」「先别管这个」时用 `interrupt`；说「顺便」「另外」时用默认 `queue` 就够了。`dsh_task` 对**正在运行**的会话默认会拒绝，拒绝信息里也会提示这两个选项。
+
+
 ## 查现在有哪些 worker
 
 ```jsonc
