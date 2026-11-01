@@ -145,12 +145,21 @@ Two measured facts:
 A worker that calls `ask_user_question` waits for a human. When the caller is another agent, nobody is there. So the bridge appends a standing instruction to every delegated task:
 
 ```
-（如果缺少必要信息或需要在多个方案里选择，直接采用最合理的默认做法继续做完，
-  不要把选择权抛回给用户、不要调用 ask_user_question 等回答；
-  在结果里用一行说明你假设了什么。）
+(If information is missing, or a choice between options is required, pick the most
+ reasonable default, finish the task, and state the assumption in one line. Do not
+ hand the decision back to the user and do not call ask_user_question.)
+```
+
+Set your own wording with `assumptionPolicy`:
+
+```yaml
+config:
+  assumptionPolicy: "If information is missing, pick the most reasonable default, finish the task, and state the assumption in one line. Do not ask the user and do not call ask_user_question."
 ```
 
 On by default (`assumeDefaults: false` disables it). It is skipped when the prompt already mentions `ask_user_question`.
+
+> The built-in default text is Chinese (`如果缺少必要信息……`), which every model in this host reads; the block above is that instruction in English. Set `assumptionPolicy` to send English verbatim.
 
 ### Questions (`pendingQuestion`)
 
@@ -215,6 +224,7 @@ Returns `{ ok, text, sessionId, durationMs }`. Runs `claude -p --output-format j
 | `maxResultChars` | `20000` | Cap on a single result payload (the head is kept) |
 | `taskTimeoutSeconds` | `300` | `dsh_task` wait cap (client may override, max 240) |
 | `assumeDefaults` | `true` | Append the decide-and-continue instruction |
+| `assumptionPolicy` | *(empty)* | Replacement text for the instruction; empty uses the built-in Chinese default |
 | `workersFile` | `~/.dsh/bridge/workers.json` | Worker registry (`0600`) |
 | `maxHops` | `1` | Delegation depth limit |
 | `dispatchPerMinute` | `10` | Dispatches allowed per window |

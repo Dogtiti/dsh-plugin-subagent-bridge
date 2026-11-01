@@ -76,6 +76,7 @@ const DEFAULTS = {
   codexSandbox: 'workspace-write',
   codexTimeoutMs: 300000,
   assumeDefaults: true,
+  assumptionPolicy: '',
   claudeBin: 'claude',
   claudeModel: '',
   claudeTimeoutMs: 300000,
@@ -329,7 +330,9 @@ const ASSUMPTION_POLICY =
 function withAssumptionPolicy(settings, message) {
   if (settings.assumeDefaults !== true) return message
   if (message.includes('ask_user_question')) return message
-  return `${message}\n\n（${ASSUMPTION_POLICY}）`
+  const custom = typeof settings.assumptionPolicy === 'string' ? settings.assumptionPolicy.trim() : ''
+  const policy = custom === '' ? ASSUMPTION_POLICY : custom
+  return `${message}\n\n（${policy}）`
 }
 
 /**
@@ -2334,6 +2337,10 @@ function resolveSettings(config) {
     if (key === 'codexSandbox' && typeof value === 'string' && value !== '') merged.codexSandbox = value
     if (key === 'assumeDefaults') {
       merged.assumeDefaults = value === true || value === 'true'
+      continue
+    }
+    if (key === 'assumptionPolicy' && typeof value === 'string') {
+      merged.assumptionPolicy = value.trim()
       continue
     }
     if (key === 'claudeBin' && typeof value === 'string' && value !== '') merged.claudeBin = value

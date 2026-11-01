@@ -725,6 +725,7 @@ function workerHost(options = {}) {
     dispatchWindowMs: options.dispatchWindowMs ?? 60000,
     codexBin: '/definitely/not/here/codex',
     assumeDefaults: options.assumeDefaults ?? true,
+    assumptionPolicy: options.assumptionPolicy ?? '',
     codexTimeoutMs: 5000,
   })
   return { api, calls, sessions, ctx, make, state }
@@ -1335,4 +1336,12 @@ test('a prompt that already talks about asking is left alone', async () => {
   const { api, calls } = workerHost()
   await api.task({ prompt: '不要用 ask_user_question，直接决定', cwd: '/tmp' })
   assert.equal(calls.prompt[0].content[0].text, '不要用 ask_user_question，直接决定')
+})
+
+test('a custom assumption policy replaces the built-in text', async () => {
+  const host = workerHost({ assumptionPolicy: 'Pick a sensible default and continue; state the assumption in one line.' })
+  await host.api.task({ prompt: 'Write a README', cwd: '/tmp' })
+  const delivered = host.calls.prompt[0].content[0].text
+  assert.match(delivered, /Pick a sensible default and continue/)
+  assert.doesNotMatch(delivered, /直接采用最合理的默认做法/)
 })
