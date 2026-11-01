@@ -5,254 +5,35 @@
 <!-- M8ven ownership proof — keep this line in place; it verifies the publisher. -->
 [![M8ven Score](https://m8ven.ai/badge/mcp/dogtiti-dsh-plugin-subagent-bridge-8a3t8k?v=f15f3e56c3fa22e8aafb88cf5428501f)](https://m8ven.ai/mcp/dogtiti-dsh-plugin-subagent-bridge-8a3t8k?s=readme)
 
-在 DeepSeek Harness 宿主内部提供**本机回环 MCP 端点**，让另一个智能体（如 Codex）把任务派给 DSH 会话并取回结果。
+在 DeepSeek Harness 宿主内部提供**本机回环 MCP 端点**，让另一个智能体把任务派给 DSH 会话并取回结果；反过来，DSH 里的 agent 也能把任务派给 Codex 或 Claude Code。
 
-插件运行在宿主进程内，直接使用公开的 `sessionController` 服务 —— 不需要读取 `~/.dsh/.credentials.yaml`，也不需要伪造 cookie。
+两个方向共用同一个插件，各自遵守对方产品的 `maxDepth: 1`：**能派活，不能再派回来**。
 
 ---
 
-## 让 DSH 派活给 Claude
+## 能力一览
 
-反向那一侧以前只有 Codex。现在多了 `claude_dispatch`：DSH 里的 agent 可以把任务交给 Claude Code，拿回最终回答。
-
-```js
-claude_dispatch({ prompt: "审一下这个 PR 的风险", cwd: "/repo", resume: "a4925654-…", model: "sonnet" })
-```
-
-| 参数 | 说明 |
-| --- | --- |
-| `prompt` | 必填，任务正文 |
-| `cwd` | 工作目录；默认用当前会话目录 |
-| `resume` | Claude Code 的 session id，续接同一段对话 |
-| `model` | 模型别名或 id；不传则用配置，再退回 Claude 自己的设置 |
-
-返回 `{ ok, text, sessionId, durationMs }`，`sessionId` 就是下次 `resume` 用的那个。
-
-和 `codex_dispatch` 的差别只在底层：Claude Code 的 `-p` 模式**一次输出一个 JSON 对象**（`{type:"result", result, session_id, is_error}`），不像 Codex 是事件流。所以解析器只看 stdout 的 JSON，**stderr 的警告不算失败**——比如模型名带 `[1M]` 后缀时 CLI 会警告，但仍然正常返回。
-
-配置项：`claudeBin`（默认 `claude`）、`claudeModel`（默认空，即用 CLI 自己的设置）、`claudeTimeoutMs`（默认 300 秒，上限 240 秒夹取）。
-
-## 创建项目（workspace）
-
-DSH 的侧边栏分组是"项目（workspace）"，和会话的工作目录是两回事：新建会话默认落在「未分组」，除非它所在的目录已经是一个项目。
-
-`dsh_task` / `dsh_spawn` 的 `workspace` 参数把这一步也接管了：
-
-```js
-// 目录不是项目 → 用它创建项目（标题取目录名），会话直接归到项目下
-dsh_task({ prompt: "…", cwd: "/repo/clawer", workspace: true })
-
-// 用指定标题创建
-dsh_spawn({ task_name: "w1", message: "…", cwd: "/repo/clawer", workspace: "Clawer" })
-
-// 不传 → 只复用已有项目；目录没有项目就保持未分组（和以前一样）
-dsh_task({ prompt: "…", cwd: "/repo/clawer" })
-```
-
-行为细节：
-
-- 目录不存在时先递归创建，再做项目登记（登记要求目录已存在）；
-- 目录已经是项目 → **直接复用，不改标题**（底层 `create` 对同一路径返回已有记录）；
-- 返回结果里带上 `workspace: { id, title, path }`，方便确认落在哪个项目；
-- 项目操作失败不影响派发本身（分组是外观，不因此让任务失败）。
-
-## 没人值守：让它自己拿主意（`assumeDefaults`）
-
-worker 卡在 `ask_user_question` 上时，需要有人在界面上点一下；但调用方是另一个 agent 时，那个人往往不在。
-
-所以桥在派发时会**自动追加一条常驻指令**：
-
-```
-（如果缺少必要信息或需要在多个方案里选择，直接采用最合理的默认做法继续做完，
-  不要把选择权抛回给用户、不要调用 ask_user_question 等回答；
-  在结果里用一行说明你假设了什么。）
-```
-
-- 默认开启，配置项 `assumeDefaults: false` 可关掉；
-- `dsh_task`、`dsh_spawn`、`dsh_followup` 三条路径都会加；
-- prompt 里本来就提到 `ask_user_question` 时不追加，避免和调用方的明确意图打架。
-
-效果：worker 不会停下来等人，而是选一个合理默认做法做完，并在结果里交代假设，调用方据此复核。
-
-## 回答 worker 的问题（`dsh_answer`）
-
-worker 需要用户拍板时会调用 `ask_user_question`，然后**卡在那里等**。如果人不在，任务就停住了。
-
-桥把这种情况暴露出来：
-
-```jsonc
-// dsh_wait 的返回
-{
-  "status": { "w1": "running" },
-  "timedOut": true,
-  "pendingQuestion": {
-    "callId": "call_abc",
-    "questions": [
-      {
-        "id": "mode",
-        "question": "用哪种模式？",
-        "header": "Choose Mode",
-        "options": [{ "label": "快速", "description": "只跑单测" }, { "label": "完整" }]
-      }
-    ]
-  },
-  "next": "blocked on a question: answer it with dsh_answer, or call dsh_wait again"
-}
-```
-
-调用方（Codex / Claude）看到 `pendingQuestion` 就可以代用户回答：
-
-```jsonc
-dsh_answer({
-  "worker": "w1",
-  "answers": [{ "id": "mode", "selected": ["快速"] }]   // custom 可用于自由文本
-})
-```
-
-细节：
-
-- 一个问题的 id 必须**恰好出现一次**，否则底层会报 `BAD_ANSWER`；
-- `selected` 是选项 label 数组，多选时给多个；跳过一个问题就给空数组；
-- 回答是插进正在等待的那个回合的（底层用 `steer`），worker 立刻继续；
-- 只有真卡在 `ask_user_question` 上才算「等待中」——工具一旦返回结果就不再报。
-
-## 排队还是插话（`mode`）
-
-DSH 的「繁忙时的发送行为」只有两种，桥把它们原样交给调用方：
-
-| `mode` | DSH 里的名字 | 行为 |
+| 方向 | 入口 | 一次调用做什么 |
 | --- | --- | --- |
-| `queue`（默认） | 排队发送 | 等当前回合跑完，再作为一个新回合处理 |
-| `steer` | 插话发送 | 并入当前回合，模型在下一步就能看到 |
+| Codex / 任意 MCP 客户端 → DSH | `dsh_task` | 开会话、投递、阻塞到这一轮结束，只回最终答案 |
+| 同上，并行 | `dsh_spawn` + `dsh_wait` | 立刻返回句柄，多个 worker 同时跑，再批量等 |
+| 同上，续派 | `dsh_followup` | 复用 worker 的上下文再派一轮 |
+| DSH → Codex | `codex_dispatch` | 跑一次 `codex exec`，回最终回答与可续接的线程 id |
+| DSH → Claude Code | `claude_dispatch` | 跑一次 `claude -p`，回最终回答与可续接的 session id |
 
-`dsh_task`、`dsh_spawn`、`dsh_followup` 都支持：
-
-```js
-dsh_followup({ worker: "w1", message: "接下来只改 src 下的文件", mode: "steer" })
-dsh_task({ sessionId: "session-…", prompt: "停一下，改成只跑单测", mode: "steer" })
-```
-
-两点实测结论：
-
-1. **`steer` 不打断正在执行的工具**。实测 worker 正在跑 `sleep 90`，`steer` 的消息投递进去了，但要等那次工具调用返回、模型走到下一步才被看到——整整 70 秒。真想立刻停，是 DSH 界面上另一个动作（取消），不是投递模式。
-2. **`steer` 不新开回合**（turn 编号不变），所以等待条件必须是「当前回合结束」。早期实现等的是「下一个回合」，答案都回来了、调用还在等，最后 120 秒超时。
-
-`dsh_task` 对正在运行的会话默认会拒绝，错误信息里会提示改用 `steer`。
-
-第三个细节是返回值：插话的回复和原任务在**同一个回合**里，所以不能简单取"这一轮最后一条 assistant 文本"——那可能是原任务后面的步骤。桥会在插话后定位到**自己那条 user/message**，只取它之后的 assistant 文本作为回答。
-
-## 创建项目（workspace）
-
-DSH 的侧边栏分组是"项目（workspace）"，和会话的工作目录是两回事：新建会话默认落在「未分组」，除非它所在的目录已经是一个项目。
-
-`dsh_task` / `dsh_spawn` 的 `workspace` 参数把这一步也接管了：
-
-```js
-// 目录不是项目 → 用它创建项目（标题取目录名），会话直接归到项目下
-dsh_task({ prompt: "…", cwd: "/repo/clawer", workspace: true })
-
-// 用指定标题创建
-dsh_spawn({ task_name: "w1", message: "…", cwd: "/repo/clawer", workspace: "Clawer" })
-
-// 不传 → 只复用已有项目；目录没有项目就保持未分组（和以前一样）
-dsh_task({ prompt: "…", cwd: "/repo/clawer" })
-```
-
-行为细节：
-
-- 目录不存在时先递归创建，再做项目登记（登记要求目录已存在）；
-- 目录已经是项目 → **直接复用，不改标题**（底层 `create` 对同一路径返回已有记录）；
-- 返回结果里带上 `workspace: { id, title, path }`，方便确认落在哪个项目；
-- 项目操作失败不影响派发本身（分组是外观，不因此让任务失败）。
-
-## 排队还是立刻打断（`mode`）
-
-DSH 的 prompt 有两种投递模式，桥把它们交给调用方选：
-
-| `mode` | 行为 |
-| --- | --- |
-| `queue`（默认） | 等当前回合跑完再处理这条消息 |
-| `steer` | 把消息**插进当前回合**（当前那一步仍会跑完） |
-| `interrupt` | **先取消当前回合**，再发送，真正立刻停下 |
-
-`dsh_task`、`dsh_spawn`、`dsh_followup` 都支持：
-
-```js
-dsh_followup({ worker: "w1", message: "别改了，先把现在的结果汇报一下", mode: "steer" })
-dsh_task({ sessionId: "session-…", prompt: "停一下，改成只跑单测", mode: "steer" })
-```
-
-和 `dsh_dispatch` 的关系：`dsh_dispatch` 一直有 `mode`，但它只投递、不等待；`dsh_task` 会阻塞到回合结束，所以以前对正在运行的会话直接拒绝。现在传 `mode: "steer"` 就允许插进运行中的会话——**它会先打断当前回合**，然后等这一轮结束才返回。
-
-两个实测出来的细节：
-
-1. **`steer` 不会打断正在执行的工具**。实测：worker 正在跑 `sleep 90`，`steer` 进去后消息被**并入当前回合**，但要等那一步工具调用结束才会被模型看到——整整等了 70 秒。原因是 `steer` 只是投递，`cancel` 才是中止。
-2. **`steer` 不新开回合**，所以等待条件不能是"下一个回合结束"。早期实现那样写，答案已经回来了、调用还在等，最后 120 秒超时。现在 steer 等的是「当前回合结束」。
-
-所以真要"按下就停"，用 `interrupt`：它先 `cancel` 掉当前回合（最多等 15 秒确认），再以普通排队模式发消息，开启新回合。
-
-返回里带 `mode` 字段，方便确认这次是排队还是打断。
-
-## 指定模型
-
-`dsh_task`、`dsh_spawn`、`dsh_followup` 都可以带 `model`，让 worker 跑在指定模型上：
-
-```js
-dsh_task({ prompt: "…", model: "zai-coding-cn/glm-5.3", reasoningEffort: "max" })
-dsh_spawn({ task_name: "review", message: "…", model: "opencode-go/deepseek-v4.1-flash" })
-dsh_followup({ worker: "review", message: "…", model: "deepseek-account/deepseek-flash" })
-```
-
-- 写法是 `provider/model`；**只写模型名**时沿用当前默认 provider（`model: "glm-5.3"`）；
-- `reasoningEffort` 可选，取值随模型（`low` / `medium` / `high` / `max` 等）；
-- 不传 `model` 就完全不动会话，行为和以前一致；
-- 实测（Host 侧 `sessionController.selectModel`）：请求头里的 provider/model 确实变成指定的那组，且**不会改写 profile 的默认模型**。
-
-实现上就是在建好会话、发第一个 prompt **之前**调一次 `selectModel`，所以 worker 的第一轮就已经在新模型上跑。
-
-## 工具
-
-| 工具 | 作用 |
-| --- | --- |
-| `dsh_task` | **同步**派活：开会话、投递、阻塞到这一轮结束，只返回**最终回答**（最后一条 assistant 消息） |
-| `dsh_spawn` | **异步**派活：立刻返回 `task_name` + `sessionId`，可同时开多个 worker 并行跑 |
-| `dsh_followup` | 给已有 worker 再派一轮（复用它的上下文） |
-| `dsh_close` | 关闭 worker，释放并发名额（不删除会话） |
-| `dsh_list_workers` | 列出本桥开的 worker 及其实时状态 |
-| `dsh_wait` | 一次等多批 worker：`targets` + `timeoutMs`，任一到达终态即返回 `{completed}` / `{errored}` / `"running"` / `"not_found"` |
-| `dsh_dispatch` | 向指定会话投递一条用户消息并开始一轮；返回 `requestId` 与 `seqAtDispatch` |
-| `dsh_read_result` | **长轮询**读进度：返回该会话在 `seqAtDispatch` 之后的**全部**助手文本（用于看过程；要结果用 `dsh_wait`） |
-| `dsh_list_sessions` | 列出会话**元数据**（id、标题、工作目录、是否运行、最后活动时间） |
-
-## 反向：DSH → Codex
-
-插件同时给本部署的 Agent 注册了一个工具：
-
-| 工具 | 参数 | 返回 |
-| --- | --- | --- |
-| `codex_dispatch` | `prompt`（必填）、`cwd`、`resume`（线程 id）、`sandbox` | `{ ok, text, threadId, exitCode, durationMs, error? }` |
-
-它执行 `codex exec [resume <id>] --json -o <临时文件>`，从事件流取 `thread.started`、从 `-o` 文件取最终消息；工具结果里会带 `[codex thread <id> · 12s]`，把那个 id 传给 `resume` 就能继续同一个 Codex 线程（实测能记住上一轮的回复）。
-
-注意：**`resume` 时 `sandbox` 与 `cwd` 不生效** —— `codex exec resume` 子命令本身不接受 `-s` / `-C`，线程沿用它原来的设置。
-
-边界（v0 硬约束）：
-
-- `dsh_list_sessions` **只返回元数据**，不含任何消息内容。
-- `dsh_read_result` 只对**本桥派发过**的会话生效；从未派发过的会话一律拒绝。
+插件运行在宿主进程内，直接用公开服务（`sessionController`、`sessions`、`workspaceRegistry`、`userQuestions`），不需要读凭据文件，也不需要伪造 cookie。
 
 ---
 
 ## 安装
 
 ```bash
-# 本地目录安装
 git clone https://github.com/Dogtiti/dsh-plugin-subagent-bridge
 ```
 
 Plugins → 添加 → 选该目录。
 
-启动后插件在 `127.0.0.1:47821` 监听，并写入端点文件（权限 0700/0600）：
+启动后在 `127.0.0.1:47821` 监听，并把端点写到 `~/.dsh/bridge/endpoint.json`（目录 0700、文件 0600）：
 
 ```json
 {
@@ -264,30 +45,180 @@ Plugins → 添加 → 选该目录。
 }
 ```
 
-路径：`~/.dsh/bridge/endpoint.json`
-
 ## 接到 Codex
 
 ```bash
 codex mcp add dsh-bridge --url "$(node -p "require(process.env.HOME+'/.dsh/bridge/endpoint.json').url")"
+codex mcp list          # 验证
+codex mcp remove dsh-bridge   # 移除
 ```
 
-验证：
+桌面 App 与 CLI 共用 `~/.codex/config.toml`，两端都会看到这条。
+
+> token 放在 URL 路径里（能力 URL），所以 Codex 侧不需要配环境变量——桌面 App 从 Finder 启动时拿不到自定义环境变量。也支持 `Authorization: Bearer <token>`，需要时可用 `--bearer-token-env-var`。
+
+Claude Code 同理：
 
 ```bash
-codex mcp list
-codex mcp get dsh-bridge
+claude mcp add --transport http dsh-bridge "<上面那个 url>" --scope user
 ```
 
-Codex 的桌面 App 与 CLI 共用 `~/.codex/config.toml`，所以两端都会看到这条。
+---
 
-> token 存在 URL 路径里（能力 URL），因此不需要在 Codex 侧配置环境变量 —— 桌面 App 从 Finder 启动时拿不到自定义环境变量。若你更想用 bearer，也可以 `--bearer-token-env-var` 指向环境变量，插件同时支持 `Authorization: Bearer <token>`。
+## 正向：Codex → DSH
 
-移除：
+### 工具
 
-```bash
-codex mcp remove dsh-bridge
+| 工具 | 作用 |
+| --- | --- |
+| `dsh_task` | **同步**派活：开会话、投递、阻塞到这一轮结束，只返回**最终回答** |
+| `dsh_spawn` | **异步**派活：立刻返回 `task_name` + `sessionId`，可并行开多个 |
+| `dsh_followup` | 给已有 worker 再派一轮（复用上下文） |
+| `dsh_wait` | 一次等多批 worker，任一到达终态即返回 |
+| `dsh_close` | 关闭 worker，释放并发名额（不删除会话） |
+| `dsh_answer` | 代用户回答 worker 提出的问题（见「问题上报」） |
+| `dsh_list_workers` | 列出本桥开的 worker 及实时状态 |
+| `dsh_dispatch` | 向指定会话投递一条用户消息并开始一轮；返回 `requestId` 与 `seqAtDispatch` |
+| `dsh_read_result` | **长轮询**读该会话在 `seqAtDispatch` 之后的全部助手文本（看过程用；要结果用 `dsh_wait`） |
+| `dsh_list_sessions` | 列出会话**元数据**（id、标题、工作目录、是否运行、最后活动时间） |
+
+### 基本用法
+
+```js
+// 同步：等它跑完，直接拿最终答案
+dsh_task({ prompt: "审一下 src/bridge.ts 的错误处理", cwd: "/repo", timeoutSeconds: 300 })
+
+// 并行：先拿句柄，再批量等
+dsh_spawn({ task_name: "audit_api", message: "…", cwd: "/repo" })
+dsh_spawn({ task_name: "audit_ui",  message: "…", cwd: "/repo" })
+dsh_wait({ targets: ["audit_api", "audit_ui"], timeoutMs: 240000 })
+
+// 续派：复用 worker 的上下文
+dsh_followup({ worker: "audit_api", message: "把第 3 条展开，给出补丁" })
 ```
+
+边界：
+
+- `dsh_list_sessions` **只返回元数据**，不含任何消息内容；
+- `dsh_read_result` 只对**本桥派发过**的会话生效，从未派发过的会话一律拒绝。
+
+### 指定模型
+
+`dsh_task`、`dsh_spawn`、`dsh_followup` 都可以带 `model`：
+
+```js
+dsh_task({ prompt: "…", model: "zai-coding-cn/glm-5.3", reasoningEffort: "max" })
+dsh_spawn({ task_name: "review", message: "…", model: "opencode-go/deepseek-v4.1-flash" })
+```
+
+- 写法是 `provider/model`；只写模型名时沿用当前默认 provider；
+- `reasoningEffort` 可选，取值随模型；
+- 不传就完全不动会话；
+- 实测：请求确实切到指定模型，且**不会改写 profile 的默认模型**。
+
+实现上是在建好会话、发第一个 prompt **之前**调一次 `selectModel`，所以 worker 第一轮就在新模型上跑。
+
+### 项目归属（`workspace`）
+
+DSH 的侧边栏分组（项目 / workspace）和工作目录是两回事：新建会话默认落在「未分组」，除非所在目录已经是项目。
+
+```js
+dsh_task({ prompt: "…", cwd: "/repo/clawer", workspace: true })     // 用目录名建项目
+dsh_spawn({ task_name: "w1", message: "…", cwd: "/repo/clawer", workspace: "Clawer" })
+dsh_task({ prompt: "…", cwd: "/repo/clawer" })                      // 只复用，不创建
+```
+
+- 目录不存在时先递归创建，再做项目登记（登记要求目录已存在）；
+- 目录已经是项目 → **复用，不改标题**；
+- 返回里带 `workspace: { id, title, path }`；
+- 项目操作失败不影响派发本身。
+
+### 排队还是插话（`mode`）
+
+DSH 的「繁忙时的发送行为」只有两种，桥原样交给调用方：
+
+| `mode` | DSH 里的名字 | 行为 |
+| --- | --- | --- |
+| `queue`（默认） | 排队发送 | 等当前回合跑完，作为新回合处理 |
+| `steer` | 插话发送 | 并入当前回合，模型下一步就能看到 |
+
+```js
+dsh_followup({ worker: "w1", message: "接下来只改 src 下的文件", mode: "steer" })
+```
+
+两个实测结论：
+
+1. **`steer` 不打断正在执行的工具**——worker 若正卡在 `sleep 90` 这类调用里，消息要等它返回才被看到（实测 70 秒）。真想立刻停下是界面上的「取消」，不是投递模式。
+2. **`steer` 不新开回合**（turn 编号不变），所以桥等的是「当前回合结束」；等「下一回合」会一直等到超时。
+
+`dsh_task` 对正在运行的会话默认拒绝，错误信息会提示改用 `steer`。插话的回复和原任务在同一回合里，桥会定位到**自己那条 user/message** 之后再取回答，避免混进原任务后续步骤的输出。
+
+### 无人值守（`assumeDefaults`）
+
+worker 卡在 `ask_user_question` 上时需要有人在界面上点一下，但调用方是另一个 agent 时那个人往往不在。因此桥在派发时**自动追加一条常驻指令**：
+
+```
+（如果缺少必要信息或需要在多个方案里选择，直接采用最合理的默认做法继续做完，
+  不要把选择权抛回给用户、不要调用 ask_user_question 等回答；
+  在结果里用一行说明你假设了什么。）
+```
+
+- 默认开启，`assumeDefaults: false` 可关；
+- `dsh_task`、`dsh_spawn`、`dsh_followup` 三条路径都会加；
+- prompt 里本来就提到 `ask_user_question` 时不追加。
+
+效果：worker 不会停下来等人，而是选一个合理默认做法做完并交代假设，调用方据此复核。
+
+### 问题上报（`pendingQuestion`）
+
+worker 真的问了问题时，`dsh_wait` 会把问题原样带出来：
+
+```jsonc
+{
+  "status": { "w1": "running" },
+  "timedOut": true,
+  "pendingQuestion": {
+    "callId": "call_abc",
+    "questions": [{
+      "id": "mode",
+      "question": "用哪种模式？",
+      "header": "Choose Mode",
+      "options": [{ "label": "快速", "description": "只跑单测" }, { "label": "完整" }]
+    }]
+  },
+  "next": "blocked on a question: answer it with dsh_answer, or call dsh_wait again"
+}
+```
+
+`dsh_answer({ worker, answers: [{ id, selected: [...] }] })` 用来代答。**已知限制**：DSH 的 `userQuestions.answer()` 只接受已经超时、进入 `continued` 状态的问题；还阻塞在工具调用里的问题是 Web UI 的 answerer 接管的，桥答不了（实测返回 `answered: false`）。所以实际使用中更该依赖上面的 `assumeDefaults`，而不是等 worker 提问。
+
+---
+
+## 反向：DSH → Codex / Claude Code
+
+两个工具都会给本部署的 Agent 注册，参数形状一致，差别只在底层 CLI。
+
+### `codex_dispatch`
+
+| 参数 | 说明 |
+| --- | --- |
+| `prompt` | 必填，任务正文 |
+| `cwd` | 工作目录，默认当前会话目录 |
+| `resume` | Codex 线程 id，续接同一线程 |
+| `sandbox` | `read-only` / `workspace-write` / `danger-full-access` |
+
+返回 `{ ok, text, threadId, exitCode, durationMs }`。执行 `codex exec [resume <id>] --json -o <临时文件>`，从事件流取 `thread.started`、从 `-o` 取最终消息。**`resume` 时 `sandbox` 与 `cwd` 不生效**——`codex exec resume` 不接受 `-s` / `-C`。
+
+### `claude_dispatch`
+
+| 参数 | 说明 |
+| --- | --- |
+| `prompt` | 必填，任务正文 |
+| `cwd` | 工作目录 |
+| `resume` | Claude Code 的 session id |
+| `model` | 模型别名或 id；不传则用配置，再退回 CLI 自己的设置 |
+
+返回 `{ ok, text, sessionId, durationMs }`。执行 `claude -p --output-format json`，只读 stdout 的单个 JSON 对象；**stderr 的警告不算失败**（模型名带 `[1M]` 后缀时 CLI 会警告，但结果正常）。
 
 ---
 
@@ -304,81 +235,76 @@ codex mcp remove dsh-bridge
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
 | `enabled` | `true` | 总开关；关闭后不监听、不写端点文件 |
-| `port` | `47821` | 回环监听端口；固定端口是为了让 Codex 侧那条 URL 在重启后依然有效 |
-| `endpointFile` | `~/.dsh/bridge/endpoint.json` | 端点与令牌的落盘位置 |
-| `maxResultChars` | `20000` | 单次 `dsh_read_result` 返回的最大字符数（超出保留尾部） |
-| `taskTimeoutSeconds` | `300` | `dsh_task` 等待一轮结束的默认上限（客户端可用 `timeoutSeconds` 覆盖，最大 600） |
-| `workersFile` | `~/.dsh/bridge/workers.json` | worker 注册表与重基线的落盘位置（0600） |
-| `maxHops` | `1` | 跨工具委派层数上限（1 = 只允许一层，和 Codex / DSH 的默认 `maxDepth: 1` 一致） |
-| `dispatchPerMinute` | `10` | 滚动窗口内允许的派发次数（spawn / task / dispatch / followup / codex_dispatch 合计） |
+| `port` | `47821` | 回环端口；固定端口让客户端那条 URL 重启后依然有效 |
+| `endpointFile` | `~/.dsh/bridge/endpoint.json` | 端点与令牌落盘位置 |
+| `maxResultChars` | `20000` | 单次结果返回的最大字符数（超出保留尾部） |
+| `taskTimeoutSeconds` | `300` | `dsh_task` 等待上限（客户端可覆盖，最大 240） |
+| `assumeDefaults` | `true` | 派发时追加「自行决策」的常驻指令 |
+| `workersFile` | `~/.dsh/bridge/workers.json` | worker 注册表（0600） |
+| `maxHops` | `1` | 跨工具委派层数上限 |
+| `dispatchPerMinute` | `10` | 滚动窗口内的派发次数 |
 | `dispatchWindowMs` | `60000` | 上述窗口长度 |
-| `maxWorkersPerRoot` | `4` | **每个工作目录**的 worker 上限（`cwd` 自动分桶，调用方不需要传 owner） |
-| `maxWorkers` | `12` | 全局兜底上限，防止多个项目一起把机器压满 |
-| `workerTtlMs` | `86400000` | 记录超过这个时间没更新就不再占名额（过期自动释放，无需手动清理） |
-| `waitTimeoutMs` | `240000` | `dsh_wait` 的默认超时（1s ~ 240s，客户端可用 `timeoutMs` 覆盖） |
-| `readWaitSeconds` | `25` | `dsh_read_result` 的默认长轮询时长（上限 55，客户端可用 `waitSeconds` 覆盖） |
-| `codexBin` | `codex` | Codex 可执行文件；含 `/` 时按路径严格解析，找不到就报错而不回退 |
-| `codexSandbox` | `workspace-write` | `codex_dispatch` 的默认 sandbox（`resume` 时无效） |
-| `codexTimeoutMs` | `300000` | 单次 `codex_dispatch` 超时，超时先 SIGTERM 再 SIGKILL |
+| `maxWorkersPerRoot` | `4` | **每个工作目录**的 worker 上限 |
+| `maxWorkers` | `12` | 全局上限 |
+| `workerTtlMs` | `86400000` | 记录过期后不再占名额 |
+| `waitTimeoutMs` | `240000` | `dsh_wait` 默认超时 |
+| `readWaitSeconds` | `25` | `dsh_read_result` 默认长轮询时长 |
+| `codexBin` | `codex` | Codex 可执行文件；含 `/` 时严格按路径解析 |
+| `codexSandbox` | `workspace-write` | `codex_dispatch` 默认 sandbox |
+| `codexTimeoutMs` | `300000` | 单次 `codex_dispatch` 超时 |
+| `claudeBin` | `claude` | Claude Code 可执行文件 |
+| `claudeModel` | 空 | 默认让 Claude CLI 用自己的设置 |
+| `claudeTimeoutMs` | `300000` | 单次 `claude_dispatch` 超时 |
 
-端口被占用时插件不会静默换端口：端到端文件里会写入 `error` 字段，并在宿主日志打印 `subagent-bridge: could not start on port …`。
+端口被占用时不会静默换端口：端点文件里写入 `error` 字段，宿主日志打印 `subagent-bridge: could not start on port …`。
 
 ---
 
-## 防环护栏
+## 护栏与限制
 
-两个 agent 都接了同一个桥时，存在真实的环路：DSH worker → `codex_dispatch` → 那次 Codex 运行也能看到 `dsh-bridge` → 又 `dsh_spawn` → …。两边**各自进程内**的深度规则都管不到这条链（Codex 的 `agent_max_depth` 只数自己的 `spawn_agent`，DSH 的 `maxDepth` 只看 `delegationDepth`，而桥建的 worker 是顶层会话，深度恒为 0）。
+### 防环
 
-所以桥自带两道：
+两个 agent 都接了同一个桥时存在真实环路：DSH worker → `codex_dispatch` → 那次 Codex 也能看到 `dsh-bridge` → 又 `dsh_spawn` → …。双方进程内的深度规则都管不到这条链（桥建的 worker 是顶层会话，深度恒为 0）。
 
-**① 深度（`maxHops`，默认 1）**
+**① 深度（`maxHops`，默认 1）**：每次派发都计算 `max(在飞链路深度, 调用方深度) + 1`，超限直接报错：
 
-- 每次都计算这次派发会产生的深度：`max(当前在飞的链路深度, 调用方深度) + 1`；
-- 调用方是桥建的 worker 时按其深度 1 起算；
-- `codex_dispatch` 运行期间会把链路标记为"在飞"，嵌套回来的调用继承该深度；
-- 超限直接报错，措辞可执行：
-  `codex_dispatch would create delegation depth 2, but maxHops is 1. Carry the work out directly instead of delegating again.`
+```
+codex_dispatch would create delegation depth 2, but maxHops is 1.
+Carry the work out directly instead of delegating again.
+```
 
-默认 1 的含义：**Codex 可以派给 DSH，但 DSH 不能再用桥派回去** —— 与两个产品各自的 `maxDepth: 1` 语义对齐。
-
-**② 速率（`dispatchPerMinute`，默认 10 / 60s）**
-
-拦截广度型失控（一次开很多 worker）和客户端紧循环重试，与提示词无关，是纯兜底：
+**② 速率（`dispatchPerMinute`，默认 10）**：拦截广度型失控与紧循环重试：
 
 ```
 rate limit: 10 dispatches per 60s reached; retry in 23s
 ```
 
-## 名额怎么算
+### 名额
 
-worker 名额**按工作目录分桶**，调用方不用传任何 owner：
-
-- 每个 `cwd` 默认 **4 个**（`maxWorkersPerRoot`）；
-- 全局默认 **12 个**（`maxWorkers`），跨项目兜底；
-- **完成但没 `dsh_close` 的仍占名额**（与 Codex 一致）；
-- 记录 **24 小时**没更新就自动不再占名额（`workerTtlMs`），不需要手动清理；
+- 每个 `cwd` 默认 **4 个**（`maxWorkersPerRoot`），全局 **12 个**（`maxWorkers`）；
+- **完成但没 `dsh_close` 的仍占名额**；
+- 记录 **24 小时**没更新自动释放；
 - 阻塞式 `dsh_task` 不计入名额，只登记。
 
-为什么不是"每个会话 4 个"：MCP 端点是共享的，请求里没有会话或线程身份（Codex 的 `CODEX_THREAD_ID` 只存在于 shell 环境）。`cwd` 是唯一由调用方稳定提供、且语义上对应"一个项目"的维度。
+按 `cwd` 分桶而不是按会话，是因为 MCP 端点共享、请求里没有会话身份；`cwd` 是唯一由调用方稳定提供、且语义上对应「一个项目」的维度。
 
-## 跨重启
+### 跨重启
 
-worker 注册表（`task_name` / `sessionId` / 终态结果）和每轮的时间基线都落在 `~/.dsh/bridge/workers.json`：
+worker 注册表和每轮的时间基线落在 `~/.dsh/bridge/workers.json`：
 
-- 派发、完成、关闭都会更新它；
-- **重启后 `dsh_list_workers` 仍能看到之前的 worker**；
-- 已经结束的 worker，`dsh_wait` 直接返回缓存里的最终回答（不必重新打开会话）；
-- 重启时还在跑的 worker，会话未打开时状态是 `offline`（结果未知，去 DSH 侧边栏打开那个会话即可查看）；
-- `dsh_followup` 会给 worker 开新一轮，同时**清掉**缓存的旧回答；
-- 文件最多保留 200 条，超出时先淘汰最旧的 **已关闭** worker。
+- 重启后 `dsh_list_workers` 仍能看到之前的 worker；
+- 已结束的 worker，`dsh_wait` 直接返回缓存里的最终回答；
+- 重启时还在跑的，会话未打开时状态为 `offline`；
+- `dsh_followup` 会开新一轮并清掉旧回答；
+- 最多保留 200 条，超出先淘汰最旧的已关闭 worker。
 
-## 安全模型
+### 安全模型
 
-- 只监听 `127.0.0.1`，不对外暴露。
-- 请求必须携带令牌：路径 `/mcp/<token>`，或 `Authorization: Bearer <token>`；比较使用定长时间比较。
-- 令牌首次启动时生成并**持久化**（重启后复用），因此能力 URL 稳定。
-- 能力等价于「向指定会话投递消息」：本机任意进程只要能读到端点文件就能派活。文件权限 0600、目录 0700；不要把它复制到共享位置。
-- DSH 侧的权限策略不受影响：派发进去的消息仍按会话自身的 sandbox / 审批策略执行。
+- 只监听 `127.0.0.1`；
+- 请求必须带令牌：路径 `/mcp/<token>` 或 `Authorization: Bearer <token>`，定长时间比较；
+- 令牌首次启动生成并持久化，能力 URL 稳定；
+- 能力等价于「向指定会话投递消息」：能读到端点文件的进程就能派活，文件 0600、目录 0700；
+- DSH 侧的权限策略不受影响，派进去的消息仍按会话自身的 sandbox / 审批策略执行。
 
 ---
 
@@ -391,22 +317,22 @@ Codex / 任意 MCP 客户端
 dsh-plugin-subagent-bridge（宿主进程内）
   · node:http 监听 127.0.0.1:47821
   · initialize / tools/list / tools/call / ping
-  · sessionController.prompt({sessionId, requestId, mode, content})
+  · sessionController.prompt({ sessionId, requestId, mode, content })
   · sessions.get(id).snapshotEvents() 读回助手文本
 ```
 
-协议实现为 **streamable HTTP 的无状态子集**：每个 POST 返回一段 `application/json`，不做服务端推送，因此取结果用**长轮询**——`dsh_read_result` 在服务端等，客户端一次调用即可拿到答案；客户端断开时服务端立即停止等待。
+协议是 **streamable HTTP 的无状态子集**：每个 POST 返回一段 `application/json`，不做服务端推送，因此取结果用**长轮询**——`dsh_read_result` 在服务端等，客户端一次调用即可拿到答案；客户端断开时服务端立即停止等待。
 
 ---
 
 ## 配套 skill
 
-`skills/` 下有两份可直接安装的 skill，把"什么时候该派活、怎么派、怎么收尾"写成模型能读的规则：
+`skills/` 下有两份可直接安装的 skill，把「什么时候该派活、怎么派、怎么收尾」写成模型能读的规则：
 
 | Skill | 装给谁 | 作用 |
 | --- | --- | --- |
 | `deepseek-worker` | Codex | 让 Codex 把任务当 subagent 派给 DSH（`dsh_task`），一次调用等结果 |
-| `delegate-to-external-agent` | DSH | 让 DSH 的 agent 在需要独立视角/复核时派给外部 agent：Codex（`codex_dispatch`）或 Claude Code（`claude_dispatch`），含两者的差别与续接方式 |
+| `delegate-to-external-agent` | DSH | 让 DSH 的 agent 在需要独立视角/复核时派给 Codex 或 Claude Code，含两者差别与续接方式 |
 
 ```bash
 # Codex 侧
@@ -416,17 +342,15 @@ mkdir -p ~/.codex/skills && cp -R skills/deepseek-worker ~/.codex/skills/
 mkdir -p ~/.dsh/skills && cp -R skills/delegate-to-external-agent ~/.dsh/skills/
 ```
 
-两份都是标准 `SKILL.md`：YAML frontmatter（`name` + `description`）+ 正文。**触发靠 description**——模型平时只看到名字和描述，判断相关了才读正文，所以描述里写满了中英触发语和"不要用"的边界。改完立刻生效，不用重启：Codex 下一次会话、DSH 下一轮就能看到。
+两份都是标准 `SKILL.md`：YAML frontmatter（`name` + `description`）+ 正文。**触发靠 description**——模型平时只看到名字和描述，判断相关了才读正文，所以描述里写满了中英触发语和「不要用」的边界。改完立刻生效，不用重启。
 
 ---
 
 ## 兼容性
 
-- DSH `^0.2.1-0`（`engines.dsh`）。
-- MCP 协议版本：`2025-06-18`、`2025-03-26`、`2024-11-05`（按客户端请求回显，未知版本回落到最新）。
-- 依赖宿主公开服务 `sessionController`（`list` / `prompt`）与 `sessions.get()`；两者不可用时工具会返回明确错误。
-
----
+- DSH `^0.2.1-0`（`engines.dsh`）；
+- MCP 协议版本：`2025-06-18`、`2025-03-26`、`2024-11-05`（按客户端请求回显，未知版本回落到最新）；
+- 依赖宿主公开服务 `sessionController`、`sessions`、`workspaceRegistry`、`userQuestions`；不可用时工具返回明确错误。
 
 ## 开发
 
@@ -434,8 +358,9 @@ mkdir -p ~/.dsh/skills && cp -R skills/delegate-to-external-agent ~/.dsh/skills/
 node --test "test/*.test.mjs"
 ```
 
-58 项：握手与版本协商、通知处理、工具清单、未知方法与未知工具、参数校验、元数据列表不含消息内容、派发调用形状、拒绝与错误透出、结果读取的时间基线、未派发会话的拒绝、长轮询（文本晚到即返回 / 超时 / 调用方取消）、真实 HTTP 往返（含 404/405/202 与 bearer 分支）、`codex exec` 事件解析、二进制解析、成功/失败/超时三种运行结果、resume 的参数分叉、工具结果的 lossless JSON 约束、**只回最终回答**（多步叙述被丢弃）、`dsh_wait` 的任一完成 / 超时 / 错误 / 未派发四种状态、`dsh_spawn` 立即返回与注册、`fork_turns=all` 走 fork、并发上限与 `dsh_close` 释放名额、`dsh_followup` 的重基线与最终回答切换、注册表落盘与重启后复原、冷会话下的缓存回答与 `offline` 状态、注册表 200 条上限的淘汰顺序、`maxHops` 拒绝回派而放行首层、在飞链路阻塞嵌套派发、速率突发的拒绝与窗口过期、followup 计入同一预算、握手版本号取自 `package.json`（不再硬编码）、新建的 worker 会按 `cwd` 自动归入对应工作区（不再落到「未分组」）、阻塞式 `dsh_task` 不占 spawn 名额（重启后也不占）、按 `cwd` 分桶的每项目预算与全局上限、过期记录到期释放名额、超时返回 `running: true` 与续等指引、阻塞时长被夹到 240 秒以内。
-`test/persistence.test.mjs` 单独覆盖持久化：文件权限 0600、缺失/损坏/畸形记录、spawn 返回时文件已落盘、完成即缓存、followup 清缓存、close 后重启仍为 closed、冷会话走缓存或 `offline`、并发写不串。
+83 项，覆盖握手与版本协商、工具清单与参数校验、派发调用形状、结果读取的时间基线、长轮询、真实 HTTP 往返（含 404/405/202 与 bearer 分支）、`codex exec` 事件解析与二进制解析、成功/失败/超时三种运行结果、resume 的参数分叉、只回最终回答、`dsh_wait` 的四种终态、并发上限与释放、followup 重基线、注册表落盘与重启复原、`maxHops` 与速率限制、按 `cwd` 分桶的预算、工作区归属、`workspace` 创建与复用、`queue` / `steer` 的投递与等待、插话回答的定位、`claude` 输出解析与 resume 参数、`assumeDefaults` 指令注入、`pendingQuestion` 与 `dsh_answer`。
+
+`test/persistence.test.mjs` 单独覆盖持久化：文件权限、缺失/损坏记录、并发写、冷会话缓存与 `offline`。
 
 ---
 
@@ -443,12 +368,11 @@ node --test "test/*.test.mjs"
 
 | 插件 | 说明 |
 | --- | --- |
+| **dsh-plugin-subagent-bridge**（本仓库） | 让 Codex 通过本机 MCP 把 DSH 当 subagent 用，反向也能派给 Codex / Claude Code |
 | [dsh-plugin-composer-predict](https://github.com/Dogtiti/dsh-plugin-composer-predict) | 预测下一条指令并显示为占位文字，`Tab` 采纳 |
 | [dsh-plugin-composer-history](https://github.com/Dogtiti/dsh-plugin-composer-history) | 输入框中按 `↑` / `↓` 回填历史消息 |
-| **dsh-plugin-subagent-bridge**（本仓库） | 让 Codex 通过本机 MCP 把 DSH 当 subagent 用（spawn / wait / followup），反向也能把任务派给 Codex |
-| [dsh-plugin-usage-panel](https://github.com/Dogtiti/dsh-plugin-usage-panel) | 在模型选择器旁显示供应商套餐额度余量（目前 GLM Coding Plan），点开是明细浮层 |
-| [dsh-plugin-provider-icons](https://github.com/Dogtiti/dsh-plugin-provider-icons) | 在模型名旁显示供应商品牌 logo（24 个厂商，支持前缀匹配） |
-
+| [dsh-plugin-usage-panel](https://github.com/Dogtiti/dsh-plugin-usage-panel) | 在模型选择器旁显示供应商套餐额度余量 |
+| [dsh-plugin-provider-icons](https://github.com/Dogtiti/dsh-plugin-provider-icons) | 在模型名旁显示供应商品牌 logo |
 
 ## 许可
 
