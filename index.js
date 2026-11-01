@@ -878,8 +878,11 @@ export function createApi(ctx, state, settings) {
       const appliedModel = await applyModelSpec(ctx, targetId, model, reasoningEffort)
       const deliveryMode = mode === 'steer' ? 'steer' : 'queue'
       const turnBefore = lastTurn(ctx, targetId)
+      /* A steered message is absorbed by the turn that is already running, so waiting for
+       * a strictly newer turn would hang until the timeout even after the answer landed. */
+      const waitAfter = deliveryMode === 'steer' ? Math.max(0, turnBefore - 1) : turnBefore
       const before = Number(sessions()?.get?.(targetId)?.seq ?? 0)
-      const finished = waitForTurnEnd(ctx, targetId, turnBefore, seconds * 1000)
+      const finished = waitForTurnEnd(ctx, targetId, waitAfter, seconds * 1000)
       const requestId = randomUUID()
       const accepted = await service.prompt(
         { sessionId: targetId, requestId, mode: deliveryMode, content: [{ type: 'text', text: prompt }] },

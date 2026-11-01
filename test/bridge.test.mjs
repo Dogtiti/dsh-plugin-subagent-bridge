@@ -587,6 +587,10 @@ function workerHost(options = {}) {
   let counter = 0
   const make = (id) => {
     const session = { id, seq: 0, snapshotEvents: () => session.events, events: [] }
+    if (options.preloadTurn !== undefined) {
+      session.events.push({ seq: 1, type: 'turn/start', data: { turn: options.preloadTurn } })
+      session.seq = 1
+    }
     sessions.set(id, session)
     return session
   }
@@ -642,7 +646,11 @@ function workerHost(options = {}) {
             calls.prompt.push(request)
             /* A pre-existing session id must not fail the fake: only its agent is busy. */
             const session = sessions.get(request.sessionId) ?? make(request.sessionId)
-            const turn = calls.prompt.filter((call) => call.sessionId === request.sessionId).length
+            const open = session.events.filter((event) => event.type === 'turn/start').length > 0
+              && session.events.filter((event) => event.type === 'turn/end').length < session.events.filter((event) => event.type === 'turn/start').length
+            const turn = open
+              ? Number(session.events.filter((event) => event.type === 'turn/start').slice(-1)[0].data.turn)
+              : calls.prompt.filter((call) => call.sessionId === request.sessionId).length
             const base = session.seq
             session.events.push({ seq: base + 1, type: 'turn/start', data: { turn } })
             session.events.push({ seq: base + 2, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: `第${String(turn)}轮结果` }] } } })
@@ -1150,4 +1158,14 @@ test('a running session is refused for queue but accepted for steer', async () =
   const busy2 = workerHost({ agentStatus: 'running' })
   await busy2.api.task({ prompt: 'x', sessionId: 'session-busy', mode: 'steer' })
   assert.equal(busy2.calls.prompt[0].mode, 'steer')
+})
+
+test('steering into a running turn resolves on that turn, not a newer one', async () => {
+  /* A running turn already started, and the steered message is absorbed by it: the fake
+   * host ends turn 1 rather than opening turn 2, which is what the real Host does. */
+  const host = workerHost({ agentStatus: 'running', preloadTurn: 1 })
+  const result = await host.api.task({ prompt: '停一下', sessionId: 'session-running', mode: 'steer', timeoutSeconds: 5 })
+  assert.equal(result.status, 'completed')
+  assert.equal(result.mode, 'steer')
+  assert.equal(host.calls.prompt[0].mode, 'steer')
 })
