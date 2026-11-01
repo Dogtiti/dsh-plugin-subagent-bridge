@@ -51,7 +51,7 @@ export const CODEX_CANDIDATES = [
 ]
 
 export const ASSUMPTION_POLICY =
-  '如果缺少必要信息或需要在多个方案里选择，直接采用最合理的默认做法继续做完，不要把选择权抛回给用户、不要调用 ask_user_question 等回答；在结果里用一行说明你假设了什么。'
+  'If information is missing or a choice between options is required, pick the most reasonable default, finish the task, and state the assumption in one line. Do not hand the decision back to the user and do not call ask_user_question.'
 
 /**
  * Attach the standing instruction when the deployment wants it.

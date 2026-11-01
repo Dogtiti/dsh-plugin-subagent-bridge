@@ -5,7 +5,9 @@ export function withAssumptionPolicy(settings, message) {
   if (message.includes('ask_user_question')) return message
   const custom = typeof settings.assumptionPolicy === 'string' ? settings.assumptionPolicy.trim() : ''
   const policy = custom === '' ? ASSUMPTION_POLICY : custom
-  return `${message}\n\n（${policy}）`
+  /* Full-width brackets only when the text itself is Chinese. */
+  const brackets = /[\u3400-\u9fff]/.test(policy) ? ['（', '）'] : ['(', ')']
+  return `${message}\n\n${brackets[0]}${policy}${brackets[1]}`
 }
 
 /**

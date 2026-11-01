@@ -145,19 +145,21 @@ dsh_followup({ worker: "w1", message: "接下来只改 src 下的文件", mode: 
 调用 `ask_user_question` 的 worker 会等人回答。调用方是另一个 agent 时，没有人在这。因此桥给每个派发的任务追加一条常驻指令：
 
 ```
-（如果缺少必要信息或需要在多个方案里选择，直接采用最合理的默认做法继续做完，
-  不要把选择权抛回给用户、不要调用 ask_user_question 等回答；
-  在结果里用一行说明你假设了什么。）
+(If information is missing, or a choice between options is required, pick the most
+ reasonable default, finish the task, and state the assumption in one line. Do not
+ hand the decision back to the user and do not call ask_user_question.)
 ```
 
 默认开启（`assumeDefaults: false` 可关闭）。prompt 里本来就提到 `ask_user_question` 时不追加。
 
-想换成自己的措辞——比如英文——用 `assumptionPolicy`：
+想换成中文——或者任何自己的措辞——用 `assumptionPolicy`：
 
 ```yaml
 config:
-  assumptionPolicy: "If information is missing, pick the most reasonable default, finish the task, and state the assumption in one line. Do not ask the user or call ask_user_question."
+  assumptionPolicy: "如果缺少必要信息，直接采用最合理的默认做法做完，并在结果里用一行说明你的假设。"
 ```
+
+> 指令正文是中文时，桥用全角括号包裹；英文等其他语言用半角括号。
 
 ### 问题上报
 
@@ -222,7 +224,7 @@ worker 真的提问时，`dsh_wait` 会把问题带出来：
 | `maxResultChars` | `20000` | 单次结果载荷上限（保留开头） |
 | `taskTimeoutSeconds` | `300` | `dsh_task` 等待上限（客户端可覆盖，最大 240） |
 | `assumeDefaults` | `true` | 追加「自行决策」指令 |
-| `assumptionPolicy` | 空 | 替换指令正文；空表示用内置中文默认 |
+| `assumptionPolicy` | 空 | 替换指令正文；空表示用内置英文默认 |
 | `workersFile` | `~/.dsh/bridge/workers.json` | worker 注册表（`0600`） |
 | `maxHops` | `1` | 委派深度上限 |
 | `dispatchPerMinute` | `10` | 每个窗口允许的派发次数 |

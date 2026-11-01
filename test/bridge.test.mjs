@@ -1324,8 +1324,8 @@ test('delegated tasks carry the standing assumption policy', async () => {
   const { api, calls } = workerHost()
   await api.task({ prompt: '整理一下这个仓库', cwd: '/tmp' })
   const delivered = calls.prompt[0].content[0].text
-  assert.match(delivered, /直接采用最合理的默认做法继续做完/)
-  assert.match(delivered, /不要调用 ask_user_question/)
+  assert.match(delivered, /pick the most reasonable default/)
+  assert.match(delivered, /do not call ask_user_question/)
 
   const off = workerHost({ assumeDefaults: false })
   await off.api.task({ prompt: '整理一下这个仓库', cwd: '/tmp' })
@@ -1343,5 +1343,5 @@ test('a custom assumption policy replaces the built-in text', async () => {
   await host.api.task({ prompt: 'Write a README', cwd: '/tmp' })
   const delivered = host.calls.prompt[0].content[0].text
   assert.match(delivered, /Pick a sensible default and continue/)
-  assert.doesNotMatch(delivered, /直接采用最合理的默认做法/)
+  assert.doesNotMatch(delivered, /pick the most reasonable default/)
 })
