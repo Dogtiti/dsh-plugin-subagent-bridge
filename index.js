@@ -1141,6 +1141,7 @@ export function createApi(ctx, state, settings) {
         let settled = false
         for (const target of targets) {
           const resolved = resolveWorker(state, target)
+          if (resolved !== undefined) attachQuestionAnswerer(state, ctx.get('agents')?.get?.(resolved.sessionId))
           const sessionId = resolved === undefined ? target : resolved.sessionId
           const value = resolved === undefined ? 'not_found' : workerStatus(ctx, sessionId, state, settings)
           if (resolved !== undefined) await rememberOutcome(settings, state, sessionId, value)
