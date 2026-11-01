@@ -56,6 +56,53 @@ dsh_task({ prompt: "…", cwd: "/repo/clawer" })
 - 返回结果里带上 `workspace: { id, title, path }`，方便确认落在哪个项目；
 - 项目操作失败不影响派发本身（分组是外观，不因此让任务失败）。
 
+## 排队还是插话（`mode`）
+
+DSH 的「繁忙时的发送行为」只有两种，桥把它们原样交给调用方：
+
+| `mode` | DSH 里的名字 | 行为 |
+| --- | --- | --- |
+| `queue`（默认） | 排队发送 | 等当前回合跑完，再作为一个新回合处理 |
+| `steer` | 插话发送 | 并入当前回合，模型在下一步就能看到 |
+
+`dsh_task`、`dsh_spawn`、`dsh_followup` 都支持：
+
+```js
+dsh_followup({ worker: "w1", message: "接下来只改 src 下的文件", mode: "steer" })
+dsh_task({ sessionId: "session-…", prompt: "停一下，改成只跑单测", mode: "steer" })
+```
+
+两点实测结论：
+
+1. **`steer` 不打断正在执行的工具**。实测 worker 正在跑 `sleep 90`，`steer` 的消息投递进去了，但要等那次工具调用返回、模型走到下一步才被看到——整整 70 秒。真想立刻停，是 DSH 界面上另一个动作（取消），不是投递模式。
+2. **`steer` 不新开回合**（turn 编号不变），所以等待条件必须是「当前回合结束」。早期实现等的是「下一个回合」，答案都回来了、调用还在等，最后 120 秒超时。
+
+`dsh_task` 对正在运行的会话默认会拒绝，错误信息里会提示改用 `steer`。
+
+## 创建项目（workspace）
+
+DSH 的侧边栏分组是"项目（workspace）"，和会话的工作目录是两回事：新建会话默认落在「未分组」，除非它所在的目录已经是一个项目。
+
+`dsh_task` / `dsh_spawn` 的 `workspace` 参数把这一步也接管了：
+
+```js
+// 目录不是项目 → 用它创建项目（标题取目录名），会话直接归到项目下
+dsh_task({ prompt: "…", cwd: "/repo/clawer", workspace: true })
+
+// 用指定标题创建
+dsh_spawn({ task_name: "w1", message: "…", cwd: "/repo/clawer", workspace: "Clawer" })
+
+// 不传 → 只复用已有项目；目录没有项目就保持未分组（和以前一样）
+dsh_task({ prompt: "…", cwd: "/repo/clawer" })
+```
+
+行为细节：
+
+- 目录不存在时先递归创建，再做项目登记（登记要求目录已存在）；
+- 目录已经是项目 → **直接复用，不改标题**（底层 `create` 对同一路径返回已有记录）；
+- 返回结果里带上 `workspace: { id, title, path }`，方便确认落在哪个项目；
+- 项目操作失败不影响派发本身（分组是外观，不因此让任务失败）。
+
 ## 排队还是立刻打断（`mode`）
 
 DSH 的 prompt 有两种投递模式，桥把它们交给调用方选：

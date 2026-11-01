@@ -1166,7 +1166,7 @@ test('a running session is refused for queue but accepted for steer', async () =
   const busy = workerHost({ agentStatus: 'running' })
   await assert.rejects(
     () => busy.api.task({ prompt: 'x', sessionId: 'session-busy' }),
-    /that session is running; pass mode:"steer" \(insert into the turn\)/,
+    /that session is running; pass mode:"steer" to insert into that turn/,
   )
   const busy2 = workerHost({ agentStatus: 'running' })
   await busy2.api.task({ prompt: 'x', sessionId: 'session-busy', mode: 'steer' })
@@ -1183,11 +1183,3 @@ test('steering into a running turn resolves on that turn, not a newer one', asyn
   assert.equal(host.calls.prompt[0].mode, 'steer')
 })
 
-test('interrupt cancels the running turn before sending', async () => {
-  const host = workerHost({ agentStatus: 'running', preloadTurn: 1 })
-  const result = await host.api.task({ prompt: '停下', sessionId: 'session-running', mode: 'interrupt', timeoutSeconds: 5 })
-  assert.deepEqual(host.calls.cancel, ['session-running'])
-  /* The message itself must be delivered as a fresh turn, not as a steer. */
-  assert.equal(host.calls.prompt[0].mode, 'queue')
-  assert.equal(result.mode, 'interrupt')
-})
