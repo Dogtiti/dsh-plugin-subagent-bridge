@@ -888,7 +888,9 @@ export function createApi(ctx, state, settings) {
         } catch {
           /* Cancelling is best effort: the send below still delivers the message. */
         }
-        await waitForTurnEnd(ctx, targetId, turnBefore, 15000)
+        /* The abort closes the *current* turn, so accept that number: waiting for a
+         * strictly newer turn burned the whole grace period before every send. */
+        await waitForTurnEnd(ctx, targetId, Math.max(0, turnBefore - 1), 15000)
       }
 
       /* A steered message is absorbed by the turn that is already running, so waiting for
