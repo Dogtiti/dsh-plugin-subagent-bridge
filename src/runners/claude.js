@@ -56,7 +56,7 @@ export async function runClaude({
   const outcome = await new Promise((resolve) => {
     let child
     try {
-      child = spawnImpl(bin, args, { cwd: cwd ?? homedir(), stdio: ['ignore', 'pipe', 'pipe'] })
+      child = spawnImpl(bin, args, { cwd: cwd ?? homedir(), stdio: ['ignore', 'pipe', 'pipe'], detached: true })
     } catch (error) {
       resolve({ exitCode: -1, stdout: '', stderr: String(error), error: String(error) })
       return
@@ -73,19 +73,23 @@ export async function runClaude({
       children?.delete(child)
       resolve(value)
     }
-    const kill = (reason) => {
+    const signalGroup = (signal) => {
+      /* The group id is the child's pid because spawning detached made it a leader. */
       try {
-        child.kill('SIGTERM')
+        process.kill(-child.pid, signal)
+        return
+      } catch {
+        /* No group (or it is already gone): fall back to the child itself. */
+      }
+      try {
+        child.kill(signal)
       } catch {
         /* Already gone. */
       }
-      setTimeout(() => {
-        try {
-          child.kill('SIGKILL')
-        } catch {
-          /* Already gone. */
-        }
-      }, 5000).unref?.()
+    }
+    const kill = (reason) => {
+      signalGroup('SIGTERM')
+      setTimeout(() => signalGroup('SIGKILL'), 5000).unref?.()
       finish({ exitCode: -1, stdout, stderr, error: reason })
     }
     const timer = setTimeout(() => kill(`claude timed out after ${timeoutMs} ms`), Math.max(1000, timeoutMs ?? 300000))

@@ -222,7 +222,7 @@ export async function callTool(id, params, api, signal) {
         if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
           throw new Error('timeoutMs must be a positive number')
         }
-        return ok(id, text(await api.wait({ targets, timeoutMs })))
+        return ok(id, text(await api.wait({ targets, timeoutMs, signal })))
       }
       case 'dsh_task': {
         const prompt = requireString(args.prompt, 'prompt')

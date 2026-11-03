@@ -93,10 +93,13 @@ export async function rememberOutcome(settings, state, sessionId, value) {
 export function resolveWorker(state, reference) {
   const record = state.workers.get(reference)
   if (record !== undefined) return { sessionId: record.sessionId, taskName: record.taskName, record }
-  if (state.dispatched.has(reference)) return { sessionId: reference }
+  /* Look the session up in the registry before falling back to "this bridge has dispatched
+   * to it": the fallback carries no record, so close and followup would silently skip the
+   * bookkeeping every worker call depends on. */
   for (const candidate of state.workers.values()) {
     if (candidate.sessionId === reference) return { sessionId: reference, taskName: candidate.taskName, record: candidate }
   }
+  if (state.dispatched.has(reference)) return { sessionId: reference }
   return undefined
 }
 
@@ -106,10 +109,18 @@ export function resolveWorker(state, reference) {
  * @param settings - resolved settings.
  */
 
-export function assertCapacity(state, settings, root) {
+export function assertCapacity(state, settings, root, ignore) {
   const now = Date.now()
+  /* In-flight spawns hold a slot before their first await, otherwise two concurrent calls
+   * both read the old count and both proceed. The caller's own reservation is excluded: it
+   * is the request being measured, not a competitor. */
   let total = 0
   let inRoot = 0
+  for (const [name, reservedRoot] of state.reserved ?? []) {
+    if (name === ignore) continue
+    total += 1
+    if (reservedRoot === root) inRoot += 1
+  }
   for (const record of state.workers.values()) {
     if (record.status === 'closed') continue
     if (record.countsTowardLimit === false) continue

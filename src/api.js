@@ -47,58 +47,70 @@ export function createApi(ctx, state, settings) {
     async spawn({ taskName, message, forkTurns, from, cwd, model, reasoningEffort, workspace, mode }) {
       const service = controller()
       if (service === undefined || service === null) throw new Error('session controller is unavailable')
-      if (state.workers.has(taskName)) throw new Error(`task_name ${JSON.stringify(taskName)} is already in use`)
+      /* Older callers build a minimal state object; keep the reservation map optional. */
+      state.reserved ??= new Map()
+      if (state.workers.has(taskName) || state.reserved.has(taskName)) {
+        throw new Error(`task_name ${JSON.stringify(taskName)} is already in use`)
+      }
       const root = typeof cwd === 'string' && cwd !== '' ? cwd : forkTurns === 'all' ? `fork:${String(from)}` : '(default)'
       guardDepth(state, settings, 0, 'dsh_spawn')
-      takeDispatchSlot(state, settings)
-      assertCapacity(state, settings, root)
+      /* Everything from here to the registry write awaits, so claim the name and the slot
+       * synchronously: two concurrent spawns must not both clear the checks above. */
+      state.reserved.set(taskName, root)
+      try {
+        assertCapacity(state, settings, root, taskName)
+        takeDispatchSlot(state, settings)
 
-      let placed
-      let sessionId
-      if (forkTurns === 'all') {
-        const parent = sessions()?.get?.(from)
-        if (parent === undefined || parent === null) {
-          /* Forking a cold session is fine: the controller reads it from storage. */
+        let placed
+        let sessionId
+        if (forkTurns === 'all') {
+          const parent = sessions()?.get?.(from)
+          if (parent === undefined || parent === null) {
+            /* Forking a cold session is fine: the controller reads it from storage. */
+          }
+          const forked = await service.fork({ sessionId: from })
+          sessionId = forked?.sessionId
+          if (typeof sessionId !== 'string' || sessionId === '') throw new Error('forking returned no session id')
+        } else {
+          const opened = await service.create(cwd === undefined ? {} : { cwd })
+          sessionId = opened?.sessionId
+          if (typeof sessionId === 'string' && sessionId !== '') {
+            placed = await attachToWorkspace(ctx, sessionId, cwd ?? undefined, workspaceOptions(workspace))
+          }
+          if (typeof sessionId !== 'string' || sessionId === '') throw new Error('session controller did not return a session id')
         }
-        const forked = await service.fork({ sessionId: from })
-        sessionId = forked?.sessionId
-        if (typeof sessionId !== 'string' || sessionId === '') throw new Error('forking returned no session id')
-      } else {
-        const opened = await service.create(cwd === undefined ? {} : { cwd })
-        sessionId = opened?.sessionId
-        if (typeof sessionId === 'string' && sessionId !== '') {
-          placed = await attachToWorkspace(ctx, sessionId, cwd ?? undefined, workspaceOptions(workspace))
-        }
-        if (typeof sessionId !== 'string' || sessionId === '') throw new Error('session controller did not return a session id')
-      }
 
-      const appliedModel = await applyModelSpec(ctx, sessionId, model, reasoningEffort)
-      attachQuestionAnswerer(state, ctx.get('agents')?.get?.(sessionId))
-      const before = Number(sessions()?.get?.(sessionId)?.seq ?? 0)
-      const requestId = randomUUID()
-      const accepted = await service.prompt(
-        { sessionId, requestId, mode: mode === 'steer' ? 'steer' : 'queue', content: [{ type: 'text', text: withAssumptionPolicy(settings, message) }] },
-        AbortSignal.timeout(30000),
-      )
-      state.dispatched.add(sessionId)
-      state.baseline.set(sessionId, before)
-      state.workers.set(taskName, {
-        taskName,
-        sessionId,
-        status: 'open',
-        countsTowardLimit: true,
-        root,
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      })
-      await saveWorkers(settings, state)
-      return {
-        task_name: taskName,
-        sessionId,
-        accepted: accepted?.accepted === true,
-        fork_turns: forkTurns,
-        ...(appliedModel === undefined ? {} : { model: appliedModel }),
-        ...(placed === undefined ? {} : { workspace: placed }),
+        const appliedModel = await applyModelSpec(ctx, sessionId, model, reasoningEffort)
+        attachQuestionAnswerer(state, ctx.get('agents')?.get?.(sessionId))
+        const before = Number(sessions()?.get?.(sessionId)?.seq ?? 0)
+        const requestId = randomUUID()
+        const accepted = await service.prompt(
+          { sessionId, requestId, mode: mode === 'steer' ? 'steer' : 'queue', content: [{ type: 'text', text: withAssumptionPolicy(settings, message) }] },
+          AbortSignal.timeout(30000),
+        )
+        state.dispatched.add(sessionId)
+        state.baseline.set(sessionId, before)
+        state.workers.set(taskName, {
+          taskName,
+          sessionId,
+          status: 'open',
+          countsTowardLimit: true,
+          root,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        })
+        await saveWorkers(settings, state)
+        return {
+          task_name: taskName,
+          sessionId,
+          accepted: accepted?.accepted === true,
+          fork_turns: forkTurns,
+          ...(appliedModel === undefined ? {} : { model: appliedModel }),
+          ...(placed === undefined ? {} : { workspace: placed }),
+        }
+      } finally {
+        /* Released on success too: the worker record now holds the slot. */
+        state.reserved.delete(taskName)
       }
     },
 
@@ -107,6 +119,20 @@ export function createApi(ctx, state, settings) {
       if (target === undefined) throw new Error(`unknown worker ${JSON.stringify(worker)}`)
       const service = controller()
       if (service === undefined || service === null) throw new Error('session controller is unavailable')
+      /* A closed worker keeps its session, so reopening is useful — but it has to pay for a
+       * slot again, otherwise "closed" would be a way to run work outside the budget. */
+      if (target.record?.status === 'closed') {
+        state.reserved ??= new Map()
+        const reservation = target.record.taskName ?? target.sessionId
+        const root = target.record.root ?? '(default)'
+        state.reserved.set(reservation, root)
+        try {
+          assertCapacity(state, settings, root, reservation)
+        } finally {
+          state.reserved.delete(reservation)
+        }
+        target.record.status = 'open'
+      }
       takeDispatchSlot(state, settings)
       const appliedModel = await applyModelSpec(ctx, target.sessionId, model, reasoningEffort)
       const before = Number(sessions()?.get?.(target.sessionId)?.seq ?? 0)
@@ -242,13 +268,14 @@ export function createApi(ctx, state, settings) {
       }
     },
 
-    async wait({ targets, timeoutMs }) {
+    async wait({ targets, timeoutMs, signal }) {
       const budget = Math.min(
         MAX_BLOCKING_SECONDS * 1000,
         Math.max(1000, Number.isFinite(timeoutMs) ? timeoutMs : settings.waitTimeoutMs),
       )
       const started = Date.now()
       for (;;) {
+        if (signal?.aborted === true) throw new Error('cancelled by the caller')
         const status = {}
         let settled = false
         for (const target of targets) {

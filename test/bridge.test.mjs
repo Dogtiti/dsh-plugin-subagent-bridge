@@ -661,6 +661,7 @@ function workerHost(options = {}) {
         return {
           create: async (request) => {
             calls.create.push(request)
+            if (options.failCreate === true) throw new Error('create failed')
             counter += 1
             const id = `session-new${String(counter)}`
             make(id)
@@ -714,7 +715,7 @@ function workerHost(options = {}) {
       return undefined
     },
   }
-  const state = { dispatched: new Set(), openQuestions: new Map(), questionAnswerers: new Map() }
+  const state = { dispatched: new Set(), openQuestions: new Map(), questionAnswerers: new Map(), reserved: new Map() }
   const api = createApi(ctx, state, {
     maxResultChars: 1000,
     maxWorkers: options.maxWorkers ?? 4,
@@ -1344,4 +1345,101 @@ test('a custom assumption policy replaces the built-in text', async () => {
   const delivered = host.calls.prompt[0].content[0].text
   assert.match(delivered, /Pick a sensible default and continue/)
   assert.doesNotMatch(delivered, /pick the most reasonable default/)
+})
+
+test('concurrent spawns cannot exceed the worker budget', async () => {
+  const host = workerHost({ maxWorkers: 1, maxWorkersPerRoot: 1 })
+  const first = host.api.spawn({ taskName: 'a', message: 'x', cwd: '/tmp/race' })
+  const second = host.api.spawn({ taskName: 'b', message: 'y', cwd: '/tmp/race' })
+  const results = await Promise.allSettled([first, second])
+  const ok = results.filter((result) => result.status === 'fulfilled')
+  const failed = results.filter((result) => result.status === 'rejected')
+  assert.equal(ok.length, 1)
+  assert.equal(failed.length, 1)
+  assert.match(String(failed[0].reason), /worker limit reached/)
+  assert.equal(host.calls.create.length, 1)
+})
+
+test('a duplicate task_name is refused even when both calls are in flight', async () => {
+  const host = workerHost()
+  const first = host.api.spawn({ taskName: 'same', message: 'x', cwd: '/tmp' })
+  const second = host.api.spawn({ taskName: 'same', message: 'y', cwd: '/tmp' })
+  const results = await Promise.allSettled([first, second])
+  assert.equal(results[0].status, 'fulfilled')
+  assert.equal(results[1].status, 'rejected')
+  assert.match(String(results[1].reason), /already in use/)
+  assert.equal(host.calls.create.length, 1)
+})
+
+test('a failed spawn releases its reservation', async () => {
+  const host = workerHost({ failCreate: true })
+  await assert.rejects(() => host.api.spawn({ taskName: 'boom', message: 'x', cwd: '/tmp/f' }))
+  assert.equal(host.state.reserved.size, 0)
+  const again = workerHost()
+  await again.api.spawn({ taskName: 'boom', message: 'x', cwd: '/tmp/f' })
+  assert.equal(again.calls.create.length, 1)
+})
+
+test('closing by session id releases the slot and clears the cached answer', async () => {
+  const host = workerHost()
+  const spawned = await host.api.spawn({ taskName: 'w', message: 'x', cwd: '/tmp' })
+  await host.api.wait({ targets: ['w'], timeoutMs: 5000 })
+  await host.api.close({ worker: spawned.sessionId })
+  assert.equal(host.state.workers.get('w').status, 'closed')
+  const next = await host.api.spawn({ taskName: 'w2', message: 'y', cwd: '/tmp', mode: 'queue' })
+  assert.ok(next.sessionId)
+})
+
+test('followup by session id clears the cached answer of that worker', async () => {
+  const host = workerHost()
+  const spawned = await host.api.spawn({ taskName: 'w', message: 'x', cwd: '/tmp' })
+  await host.api.wait({ targets: ['w'], timeoutMs: 5000 })
+  assert.ok(host.state.workers.get('w').outcome !== undefined)
+  await host.api.followup({ worker: spawned.sessionId, message: 'again' })
+  assert.equal(host.state.workers.get('w').outcome, undefined)
+})
+
+test('a closed worker is reopened by followup and pays for a slot again', async () => {
+  const host = workerHost({ maxWorkers: 1 })
+  await host.api.spawn({ taskName: 'w', message: 'x', cwd: '/tmp' })
+  await host.api.close({ worker: 'w' })
+  const result = await host.api.followup({ worker: 'w', message: 'again' })
+  assert.equal(result.worker, 'w')
+  assert.equal(host.state.workers.get('w').status, 'open')
+})
+
+test('wait stops when the caller cancels', async () => {
+  const host = workerHost({ agentStatus: 'running' })
+  await host.api.spawn({ taskName: 'slow', message: 'x', cwd: '/tmp' })
+  const controller = new AbortController()
+  setTimeout(() => controller.abort(), 30)
+  await assert.rejects(() => host.api.wait({ targets: ['slow'], timeoutMs: 10000, signal: controller.signal }), /cancelled/)
+})
+
+test('a timed-out run takes the whole process group down', async () => {
+  const { EventEmitter } = await import('node:events')
+  const signals = []
+  const original = process.kill
+  process.kill = (pid, signal) => {
+    signals.push({ pid, signal })
+    return true
+  }
+  try {
+    const spawnImpl = (bin, args, options) => {
+      assert.equal(options.detached, true, 'the CLI must lead its own process group')
+      const child = new EventEmitter()
+      child.pid = 4242
+      child.stdout = new EventEmitter()
+      child.stderr = new EventEmitter()
+      child.kill = () => {}
+      return child
+    }
+    const result = await runClaude({ bin: '/fake/claude', prompt: 'x', timeoutMs: 20, spawnImpl })
+    assert.equal(result.ok, false)
+    assert.match(String(result.error), /timed out/)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    assert.deepEqual(signals[0], { pid: -4242, signal: 'SIGTERM' })
+  } finally {
+    process.kill = original
+  }
 })

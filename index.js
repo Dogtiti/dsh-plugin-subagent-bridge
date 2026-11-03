@@ -26,7 +26,7 @@ export function apply(ctx, config = {}) {
   const settings = resolveSettings(config)
   if (settings.enabled !== true) return
 
-  const state = { dispatched: new Set(), children: new Set(), openQuestions: new Map(), questionAnswerers: new Map() }
+  const state = { dispatched: new Set(), children: new Set(), openQuestions: new Map(), questionAnswerers: new Map(), reserved: new Map() }
   const api = createApi(ctx, state, settings)
   let bridge
 

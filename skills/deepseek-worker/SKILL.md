@@ -8,7 +8,7 @@ description: 交给 DSH / 开个 worker 时使用；把自足任务当 subagent 
 DSH 是通过 `dsh-bridge` MCP 接上来的另一个编码代理。用法和"给自己开一个 subagent"一样：**给它一个自足的任务，等它把这一轮干完并返回结论。**
 
 > **最重要的一条：任务没跑完，不许结束回合。**
-> Codex 原生的 subagent 会把结果**推送**回来、自动唤醒你；这个桥是**拉取**式的 —— 你结束回合，结果就没人接收了，用户只能人工来叫你回去。所以：只要还有 `running` 的 worker，就必须继续调 `dsh_wait` / `dsh_task` / `dsh_read_result`，直到全部到终态。
+> Codex 原生的 subagent 会把结果**推送**回来、自动唤醒你；这个桥是**拉取**式的 —— 你结束回合，结果就没人接收了，用户只能人工来叫你回去。所以：只要还有 `running` 的 worker，就必须继续调 `dsh_wait`（或 `dsh_read_result` 看过程），直到全部到终态。
 
 > **单次调用最长 240 秒。** Codex 的 MCP 客户端在 **300 秒**时会把工具调用判为失败（`timed out awaiting tools/call after 300s`）。所以 `timeoutSeconds` / `timeoutMs` / `waitSeconds` 一律不要超过 240，超了也不会生效（会被夹到 240）。
 
@@ -50,13 +50,16 @@ dsh_task({
 
 **看到 `running: true` 就继续等**，不要结束回合、也不要把空 `text` 当成"它没干成"。
 
-最省事的续等方式（`dsh_task` 本身会阻塞，再调一次同一个 sessionId 等价于继续等）：
+继续等**只能用 `dsh_wait`**：
 
 ```jsonc
-dsh_task({ "sessionId": "session-…", "prompt": "继续", "timeoutSeconds": 240 })
+dsh_wait({ "targets": ["session-…或 task_name"], "timeoutMs": 240000 })
 ```
 
-更好的方式是不用 `dsh_task` 的续做语义，而是直接用 `dsh_wait` 等它（见下节）。
+不要用 `dsh_task` 续等。它有两个坑：
+
+- worker 还在跑时，`dsh_task({sessionId})` 会被直接拒绝（`that session is running`）；
+- worker 已经跑完时，`dsh_task({sessionId, prompt:"继续"})` 会**又派一条消息**，多花一次钱、还可能让对方重做一遍。
 
 ## 多件活：并行开 worker
 
@@ -214,7 +217,7 @@ worker 收到的是**一条普通用户消息**，它看不到你这边有没有
 
 - `completed` → 读 `text`，判断是否真的达成交付；需要复核就自己跑一遍验证命令。
 - `turn-…`（如 `turn-aborted`、`turn-error`）→ 那一轮没正常结束，把 `text` 里的信息转述给用户，必要时自己接手。
-- `timeout`（带 `running: true`）→ 工作**没有丢**，DSH 那边还在跑。**必须继续等**：`dsh_wait({targets:[…]})` 或再调一次 `dsh_task({sessionId, …})`，直到不是 running。
+- `timeout`（带 `running: true`）→ 工作**没有丢**，DSH 那边还在跑。**必须继续等**：`dsh_wait({targets:[…]})`，直到不是 running。**不要**用 `dsh_task` 续等（运行中会被拒绝，跑完则会多派一条消息）。
 
 ## 同一个 worker 继续干
 
@@ -222,7 +225,7 @@ worker 收到的是**一条普通用户消息**，它看不到你这边有没有
 dsh_followup({ "worker": "audit_api", "message": "把第 3 条展开，给出补丁" })
 ```
 
-`dsh_followup` 复用该 worker 的会话，比新开一个便宜。也可以用 `dsh_task({ "sessionId": …, "prompt": … })` 做同样的事（阻塞版）。
+`dsh_followup` 复用该 worker 的会话，比新开一个便宜。要**阻塞等结果**用 `dsh_wait`，不要用 `dsh_task` —— 它看到运行中的会话会拒绝，跑完则会多派一条消息。
 
 ## 改主意时：排队还是插话
 

@@ -63,7 +63,9 @@ export async function runCodex({
     const outcome = await new Promise((resolve) => {
       let child
       try {
-        child = spawnImpl(bin, args, { cwd: cwd ?? homedir(), stdio: ['ignore', 'pipe', 'pipe'] })
+        /* detached: the CLI becomes a process-group leader, so a timeout can take its own
+         * children down with it instead of leaving them writing files behind us. */
+        child = spawnImpl(bin, args, { cwd: cwd ?? homedir(), stdio: ['ignore', 'pipe', 'pipe'], detached: true })
       } catch (error) {
         resolve({ exitCode: -1, stdout: '', stderr: String(error), error: String(error) })
         return
