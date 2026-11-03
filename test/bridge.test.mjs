@@ -6,7 +6,7 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { createApi, createBridgeServer, handleJsonRpc, pendingQuestion, parseCodexOutput, resolveCodex, runCodex, parseClaudeOutput, runClaude, saveWorkers } from '../index.js'
+import { createApi, createBridgeServer, handleJsonRpc, pendingQuestion, parseCodexOutput, resolveCodex, runCodex, parseClaudeOutput, runClaude, saveWorkers, sumUsage, operationReport } from '../index.js'
 
 const SESSION_ID = 'session-test'
 const TOKEN = 'k'.repeat(32)
@@ -1518,4 +1518,45 @@ test('the result envelope wins over system events in the same stream', async () 
   const parsed = parseClaudeOutput(stdout)
   assert.equal(parsed.text, '最终答案')
   assert.equal(parsed.error, undefined)
+})
+
+test('each dispatch gets its own operation id and sequence window', async () => {
+  const host = workerHost()
+  const first = await host.api.task({ prompt: 'one', cwd: '/tmp' })
+  const second = await host.api.task({ prompt: 'two', sessionId: first.sessionId })
+  assert.notEqual(first.operationId, second.operationId)
+  assert.equal(typeof first.requestId, 'string')
+  assert.ok(second.seqStart >= first.seqEnd, 'the second window starts where the first ended')
+  assert.equal(host.state.operations.size, 2)
+})
+
+test('a task reports the model and usage the session actually produced', async () => {
+  const host = workerHost()
+  const spawned = await host.api.spawn({ taskName: 'u', message: 'x', cwd: '/tmp' })
+  const session = host.sessions.get(spawned.sessionId)
+  const base = session.seq
+  session.events.push({ seq: base + 1, type: 'request/context', data: { provider: 'zai-coding-cn', model: 'glm-5.3', contextWindow: 1000 } })
+  session.events.push({
+    seq: base + 2,
+    type: 'assistant/message',
+    data: { usage: { inputTokens: 10, outputTokens: 4, totalTokens: 14 }, message: { content: [{ type: 'text', text: 'ok' }] } },
+  })
+  session.seq = base + 2
+  const report = await host.api.wait({ targets: ['u'], timeoutMs: 1000 })
+  assert.ok(report.report?.u !== undefined, 'the wait result carries a per-worker report')
+  assert.equal(report.report.u.model.provider, 'zai-coding-cn')
+  assert.equal(report.report.u.model.model, 'glm-5.3')
+  assert.deepEqual(report.report.u.usage, { inputTokens: 10, outputTokens: 4, totalTokens: 14 })
+})
+
+test('usage sums only inside the operation window', async () => {
+  const host = workerHost()
+  const session = host.make('s-window')
+  session.events.push({ seq: 1, type: 'assistant/message', data: { usage: { inputTokens: 999 }, message: { content: [] } } })
+  session.seq = 1
+  host.state.dispatched.add('s-window')
+  const usage = sumUsage(host.ctx, 's-window', 1)
+  assert.equal(usage, undefined, 'nothing after the window start means no usage')
+  session.events.push({ seq: 2, type: 'assistant/message', data: { usage: { inputTokens: 5, outputTokens: 1 }, message: { content: [] } } })
+  assert.deepEqual(sumUsage(host.ctx, 's-window', 1), { inputTokens: 5, outputTokens: 1 })
 })

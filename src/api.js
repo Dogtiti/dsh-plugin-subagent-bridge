@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { MAX_BLOCKING_SECONDS, MAX_WAIT_SECONDS } from './constants.js'
 import { callerDepth, enterChain, guardDepth, leaveChain, takeDispatchSlot } from './guards.js'
+import { beginOperation, finishOperation, modelInWindow, operationReport, sumUsage } from './operations.js'
 import { withAssumptionPolicy } from './policy.js'
 import { askable, attachQuestionAnswerer, pendingQuestion } from './questions.js'
 import { assertCapacity, rememberOutcome, resolveWorker, saveWorkers } from './registry.js'
@@ -90,6 +91,14 @@ export function createApi(ctx, state, settings) {
         )
         state.dispatched.add(sessionId)
         state.baseline.set(sessionId, before)
+        const spawnedOperation = beginOperation(state, {
+          sessionId,
+          requestId,
+          kind: 'spawn',
+          mode: mode === 'steer' ? 'steer' : 'queue',
+          seqStart: before,
+        })
+        finishOperation(spawnedOperation, { status: 'accepted' })
         state.workers.set(taskName, {
           taskName,
           sessionId,
@@ -107,6 +116,9 @@ export function createApi(ctx, state, settings) {
           fork_turns: forkTurns,
           ...(appliedModel === undefined ? {} : { model: appliedModel }),
           ...(placed === undefined ? {} : { workspace: placed }),
+          operationId: spawnedOperation.operationId,
+          requestId,
+          seqStart: before,
         }
       } finally {
         /* Released on success too: the worker record now holds the slot. */
@@ -142,10 +154,20 @@ export function createApi(ctx, state, settings) {
         AbortSignal.timeout(30000),
       )
       state.baseline.set(target.sessionId, before)
+      const operation = beginOperation(state, {
+        sessionId: target.sessionId,
+        requestId,
+        kind: 'followup',
+        mode: mode === 'steer' ? 'steer' : 'queue',
+        seqStart: before,
+      })
+      finishOperation(operation, { status: 'accepted' })
+      const report = { operationId: operation.operationId, requestId, seqStart: before }
       if (target.record !== undefined) {
         /* A new turn invalidates the cached answer. */
         delete target.record.outcome
         target.record.updatedAt = Date.now()
+        target.record.operationId = operation.operationId
       }
       await saveWorkers(settings, state)
       return {
@@ -153,6 +175,7 @@ export function createApi(ctx, state, settings) {
         sessionId: target.sessionId,
         accepted: accepted?.accepted === true,
         ...(appliedModel === undefined ? {} : { model: appliedModel }),
+        ...report,
       }
     },
 
@@ -216,6 +239,13 @@ export function createApi(ctx, state, settings) {
       const before = Number(sessions()?.get?.(targetId)?.seq ?? 0)
       const finished = waitForTurnEnd(ctx, targetId, waitAfter, seconds * 1000)
       const requestId = randomUUID()
+      const operation = beginOperation(state, {
+        sessionId: targetId,
+        requestId,
+        kind: created ? 'task' : 'task-continue',
+        mode: deliveryMode,
+        seqStart: before,
+      })
       const accepted = await service.prompt(
         { sessionId: targetId, requestId, mode: deliveryMode, content: [{ type: 'text', text: withAssumptionPolicy(settings, prompt) }] },
         AbortSignal.timeout(30000),
@@ -257,6 +287,15 @@ export function createApi(ctx, state, settings) {
               next: `the worker is still running; do not end the turn. Call dsh_wait({targets:["${targetId}"],timeoutMs:${String(MAX_BLOCKING_SECONDS * 1000)}}) and repeat until it is not "running".`,
             }
           : {}),
+        /* The operation report comes first so the caller's explicit model selection keeps its
+         * established shape below. */
+        ...operationReport(finishOperation(operation, {
+          status,
+          seqEnd: Number(sessions()?.get?.(targetId)?.seq ?? 0),
+          text: collected.text,
+          model: modelInWindow(ctx, targetId, before),
+          usage: sumUsage(ctx, targetId, before),
+        })),
         ...(appliedModel === undefined ? {} : { model: appliedModel }),
         ...(placed === undefined ? {} : { workspace: placed }),
         mode: deliveryMode,
@@ -274,6 +313,7 @@ export function createApi(ctx, state, settings) {
         Math.max(1000, Number.isFinite(timeoutMs) ? timeoutMs : settings.waitTimeoutMs),
       )
       const started = Date.now()
+      const reports = {}
       for (;;) {
         if (signal?.aborted === true) throw new Error('cancelled by the caller')
         const status = {}
@@ -283,7 +323,19 @@ export function createApi(ctx, state, settings) {
           if (resolved !== undefined) attachQuestionAnswerer(state, ctx.get('agents')?.get?.(resolved.sessionId))
           const sessionId = resolved === undefined ? target : resolved.sessionId
           const value = resolved === undefined ? 'not_found' : workerStatus(ctx, sessionId, state, settings)
-          if (resolved !== undefined) await rememberOutcome(settings, state, sessionId, value)
+          if (resolved !== undefined) {
+            await rememberOutcome(settings, state, sessionId, value)
+            if (typeof value !== 'string') {
+              const record = resolved.record ?? [...state.workers.values()].find((candidate) => candidate.sessionId === sessionId)
+              const operation = record?.operationId === undefined ? undefined : state.operations?.get(record.operationId)
+              const sinceSeq = operation?.seqStart ?? Number(state.baseline.get(sessionId) ?? 0)
+              reports[target] = {
+                ...(operation === undefined ? {} : { operationId: operation.operationId, requestId: operation.requestId, seqStart: operation.seqStart }),
+                ...(modelInWindow(ctx, sessionId, sinceSeq) === undefined ? {} : { model: modelInWindow(ctx, sessionId, sinceSeq) }),
+                ...(sumUsage(ctx, sessionId, sinceSeq) === undefined ? {} : { usage: sumUsage(ctx, sessionId, sinceSeq) }),
+              }
+            }
+          }
           status[target] = value
           /* `not_found`, `closed` and `offline` are final too: waiting cannot change them. */
           const final = value === 'not_found' || value === 'closed' || value === 'offline'
@@ -291,7 +343,15 @@ export function createApi(ctx, state, settings) {
         }
         const waitedMs = Date.now() - started
         const asked = askable(state, ctx, targets)
-        if (settled) return { status, timedOut: false, waitedMs, ...(asked === undefined ? {} : { pendingQuestion: asked }) }
+        if (settled) {
+          return {
+            status,
+            timedOut: false,
+            waitedMs,
+            ...(asked === undefined ? {} : { pendingQuestion: asked }),
+            ...(reports === undefined ? {} : { report: reports }),
+          }
+        }
         if (waitedMs >= budget) {
           const still = targets.filter((target) => status[target] === 'running' || status[target] === 'pending')
           return {
@@ -347,7 +407,16 @@ export function createApi(ctx, state, settings) {
       )
       state.dispatched.add(sessionId)
       state.baseline.set(sessionId, before)
-      return { accepted: result?.accepted === true, sessionId, requestId, mode, seqAtDispatch: before }
+      const operation = beginOperation(state, { sessionId, requestId, kind: 'dispatch', mode, seqStart: before })
+      finishOperation(operation, { status: 'accepted' })
+      return {
+        accepted: result?.accepted === true,
+        sessionId,
+        requestId,
+        mode,
+        seqAtDispatch: before,
+        operationId: operation.operationId,
+      }
     },
 
     async readResult({ sessionId, sinceSeq, waitSeconds, signal }) {

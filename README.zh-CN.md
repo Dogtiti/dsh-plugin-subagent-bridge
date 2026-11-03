@@ -81,7 +81,7 @@ dsh_followup({ worker: "audit_api", message: "把第 3 条展开，附上补丁"
 
 | 工具 | 作用 |
 | --- | --- |
-| `dsh_task` | 同步派活：开会话、投递、阻塞到回合结束，返回最终回答 |
+| `dsh_task` | 同步派活：开会话、投递、阻塞到回合结束，返回最终回答，外加 `operationId`、`requestId`、`usage` 和实际使用的模型 |
 | `dsh_spawn` | 异步派活：立刻返回 `task_name` + `sessionId` |
 | `dsh_followup` | 在已有 worker 上再派一轮，复用其上下文 |
 | `dsh_wait` | 一次等多个 worker，任一到达终态即返回 |

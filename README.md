@@ -81,7 +81,7 @@ dsh_followup({ worker: "audit_api", message: "Expand item 3 and attach a patch" 
 
 | Tool | Purpose |
 | --- | --- |
-| `dsh_task` | Synchronous dispatch: create session, deliver, block to end of turn, return the final answer |
+| `dsh_task` | Synchronous dispatch: create session, deliver, block to end of turn, return the final answer, plus `operationId`, `requestId`, `usage` and the model the worker actually used |
 | `dsh_spawn` | Asynchronous dispatch: returns `task_name` + `sessionId` immediately |
 | `dsh_followup` | Another round on an existing worker, reusing its context |
 | `dsh_wait` | Wait on several workers at once; returns when any reaches a terminal state |
