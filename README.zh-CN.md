@@ -1,11 +1,9 @@
-# dsh-plugin-subagent-bridge
+# dsh-subagent-bridge
 
 > 让 Codex 或 Claude Code 把 DeepSeek Harness 会话当作 subagent 来用 —— 反过来，DSH 也能把任务派给它们。
 
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![dsh](https://img.shields.io/badge/DSH-%5E0.2.1--0-2f6fed)](https://github.com/deepseek-ai/deepseek-harness)
-<!-- M8ven ownership proof — keep this line in place; it verifies the publisher. -->
-[![M8ven Score](https://m8ven.ai/badge/mcp/dogtiti-dsh-plugin-subagent-bridge-8a3t8k?v=f15f3e56c3fa22e8aafb88cf5428501f)](https://m8ven.ai/mcp/dogtiti-dsh-plugin-subagent-bridge-8a3t8k?s=readme)
 
 [English](README.md)
 
@@ -29,7 +27,7 @@
 ## 安装
 
 ```bash
-git clone https://github.com/Dogtiti/dsh-plugin-subagent-bridge
+git clone https://github.com/Dogtiti/dsh-subagent-bridge
 ```
 
 在 DSH 里打开 **Plugins → 添加**，选择该目录。启动后插件监听 `127.0.0.1:47821`，并写入端点文件：
@@ -211,7 +209,7 @@ worker 真的提问时，`dsh_wait` 会把问题带出来：
 ```yaml
 - insert:
     - id: subagent-bridge
-      name: 'dsh-plugin-subagent-bridge'
+      name: 'dsh-subagent-bridge'
       config:
         port: 47821
 ```
@@ -270,7 +268,7 @@ rate limit: 10 dispatches per 60s reached; retry in 23s
 Codex / 任意 MCP 客户端
   │  POST /mcp/<token>   JSON-RPC（无状态，单次 JSON 响应）
   ▼
-dsh-plugin-subagent-bridge（宿主进程内）
+dsh-subagent-bridge（宿主进程内）
   · node:http 监听 127.0.0.1:47821
   · initialize / tools/list / tools/call / ping
   · sessionController.prompt({ sessionId, requestId, mode, content })
@@ -330,7 +328,7 @@ src/runners/claude.js claude -p adapter
 
 | 插件 | 说明 |
 | --- | --- |
-| **dsh-plugin-subagent-bridge**（本仓库） | 让 Codex 把 DSH 当 subagent 用，DSH 也能派给 Codex / Claude Code |
+| **dsh-subagent-bridge**（本仓库） | 让 Codex 把 DSH 当 subagent 用，DSH 也能派给 Codex / Claude Code |
 | [dsh-plugin-composer-predict](https://github.com/Dogtiti/dsh-plugin-composer-predict) | 预测下一条指令并显示为占位文字，`Tab` 采纳 |
 | [dsh-plugin-composer-history](https://github.com/Dogtiti/dsh-plugin-composer-history) | 输入框中按 `↑` / `↓` 回填历史消息 |
 | [dsh-plugin-usage-panel](https://github.com/Dogtiti/dsh-plugin-usage-panel) | 在模型选择器旁显示供应商额度余量 |

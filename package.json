@@ -1,6 +1,6 @@
 {
-  "name": "dsh-plugin-subagent-bridge",
-  "version": "0.18.0",
+  "name": "dsh-subagent-bridge",
+  "version": "0.19.0",
   "type": "module",
   "description": "Subagent bridge: lets Codex delegate a task to DeepSeek Harness the way it would spawn a subagent (one call, waits for the answer), plus a codex_dispatch tool for the reverse direction.",
   "keywords": [
@@ -13,10 +13,10 @@
   ],
   "author": "Dogtiti",
   "license": "MIT",
-  "homepage": "https://github.com/Dogtiti/dsh-plugin-subagent-bridge#readme",
+  "homepage": "https://github.com/Dogtiti/dsh-subagent-bridge#readme",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Dogtiti/dsh-plugin-subagent-bridge"
+    "url": "https://github.com/Dogtiti/dsh-subagent-bridge"
   },
   "exports": {
     ".": "./index.js",
@@ -43,5 +43,8 @@
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
+  },
+  "bugs": {
+    "url": "https://github.com/Dogtiti/dsh-subagent-bridge/issues"
   }
 }

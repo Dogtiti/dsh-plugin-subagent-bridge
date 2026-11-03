@@ -9,7 +9,7 @@ description: 交给外部 agent / 让另一个 agent 审一下 / review / 第二
 
 ## 先确认可用
 
-- 工具列表里有 `codex_dispatch` / `claude_dispatch` 才能用。没有 → 这个部署没装 `dsh-plugin-subagent-bridge`，或者对应二进制没找到。
+- 工具列表里有 `codex_dispatch` / `claude_dispatch` 才能用。没有 → 这个部署没装 `dsh-subagent-bridge`，或者对应二进制没找到。
 - 返回 `codex executable not found` / `claude executable not found` → CLI 不在 PATH。告诉用户在插件配置 `codexBin` / `claudeBin` 里指绝对路径，不要反复重试。
 - 返回 `exited with …` → 多半是未登录、额度用尽或模型名不被支持。把后面几行原样转述，别自己编原因。
 
@@ -85,7 +85,7 @@ Codex 续接时换目录/换权限要开新线程；Claude 续接时 `cwd` 仍�
 
 对方收到的是一条**普通任务消息**，它不知道 DSH 有哪些技能或工具。而且它自己**也可能接着 `dsh-bridge` 这个 MCP**——所以 prompt 里出现桥的名字，可能把它引去反向调 `dsh_dispatch`，白白绕一圈甚至形成来回。
 
-- ❌ 不要把 DSH 的技能名/工具名写进 prompt：`用 codex_dispatch 执行这个任务`、`请通过 dsh-plugin-subagent-bridge 回复`、`你是被 DSH 派来的`
+- ❌ 不要把 DSH 的技能名/工具名写进 prompt：`用 codex_dispatch 执行这个任务`、`请通过 dsh-subagent-bridge 回复`、`你是被 DSH 派来的`
 - ❌ 不要交代协作机制或角色：`主程序是 DSH，你只是执行者，完成后回调`
 - ❌ 不要复述元指令：`用户让我找个别的模型来做`
 - ✅ 只写任务本身：背景、要审/要改的具体路径、验收标准、边界、输出格式。

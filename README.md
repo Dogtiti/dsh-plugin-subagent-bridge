@@ -1,11 +1,9 @@
-# dsh-plugin-subagent-bridge
+# dsh-subagent-bridge
 
 > Let Codex or Claude Code drive DeepSeek Harness sessions as subagents — and let DSH drive them back.
 
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![dsh](https://img.shields.io/badge/DSH-%5E0.2.1--0-2f6fed)](https://github.com/deepseek-ai/deepseek-harness)
-<!-- M8ven ownership proof — keep this line in place; it verifies the publisher. -->
-[![M8ven Score](https://m8ven.ai/badge/mcp/dogtiti-dsh-plugin-subagent-bridge-8a3t8k?v=f15f3e56c3fa22e8aafb88cf5428501f)](https://m8ven.ai/mcp/dogtiti-dsh-plugin-subagent-bridge-8a3t8k?s=readme)
 
 [中文说明](README.zh-CN.md)
 
@@ -29,7 +27,7 @@ The plugin runs inside the Harness host and exposes a loopback MCP endpoint. It 
 ## Install
 
 ```bash
-git clone https://github.com/Dogtiti/dsh-plugin-subagent-bridge
+git clone https://github.com/Dogtiti/dsh-subagent-bridge
 ```
 
 Open **Plugins → Add** in DSH and pick that directory. On start the plugin listens on `127.0.0.1:47821` and writes the endpoint file:
@@ -209,7 +207,7 @@ Returns `{ ok, text, sessionId, durationMs }`. Runs `claude -p --output-format j
 ```yaml
 - insert:
     - id: subagent-bridge
-      name: 'dsh-plugin-subagent-bridge'
+      name: 'dsh-subagent-bridge'
       config:
         port: 47821
 ```
@@ -268,7 +266,7 @@ rate limit: 10 dispatches per 60s reached; retry in 23s
 Codex / any MCP client
   │  POST /mcp/<token>   JSON-RPC (stateless, single JSON response)
   ▼
-dsh-plugin-subagent-bridge (inside the host process)
+dsh-subagent-bridge (inside the host process)
   · node:http on 127.0.0.1:47821
   · initialize / tools/list / tools/call / ping
   · sessionController.prompt({ sessionId, requestId, mode, content })
@@ -328,7 +326,7 @@ src/runners/claude.js claude -p adapter
 
 | Plugin | Description |
 | --- | --- |
-| **dsh-plugin-subagent-bridge** (this repo) | Let Codex drive DSH as a subagent, and DSH drive Codex / Claude Code |
+| **dsh-subagent-bridge** (this repo) | Let Codex drive DSH as a subagent, and DSH drive Codex / Claude Code |
 | [dsh-plugin-composer-predict](https://github.com/Dogtiti/dsh-plugin-composer-predict) | Predicts the next instruction as placeholder text; `Tab` accepts |
 | [dsh-plugin-composer-history](https://github.com/Dogtiti/dsh-plugin-composer-history) | `↑` / `↓` in the composer to recall previous messages |
 | [dsh-plugin-usage-panel](https://github.com/Dogtiti/dsh-plugin-usage-panel) | Provider quota next to the model picker |
