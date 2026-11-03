@@ -327,10 +327,10 @@ src/runners/claude.js claude -p adapter
 | Plugin | Description |
 | --- | --- |
 | **dsh-subagent-bridge** (this repo) | Let Codex drive DSH as a subagent, and DSH drive Codex / Claude Code |
-| [dsh-plugin-composer-predict](https://github.com/Dogtiti/dsh-plugin-composer-predict) | Predicts the next instruction as placeholder text; `Tab` accepts |
-| [dsh-plugin-composer-history](https://github.com/Dogtiti/dsh-plugin-composer-history) | `↑` / `↓` in the composer to recall previous messages |
-| [dsh-plugin-usage-panel](https://github.com/Dogtiti/dsh-plugin-usage-panel) | Provider quota next to the model picker |
-| [dsh-plugin-provider-icons](https://github.com/Dogtiti/dsh-plugin-provider-icons) | Provider logos next to model names |
+| [dsh-predict](https://github.com/Dogtiti/dsh-predict) | Predicts the next instruction as placeholder text; `Tab` accepts |
+| [dsh-input-history](https://github.com/Dogtiti/dsh-input-history) | `↑` / `↓` in the composer to recall previous messages |
+| [dsh-quota-meter](https://github.com/Dogtiti/dsh-quota-meter) | Provider quota next to the model picker |
+| [dsh-provider-icons](https://github.com/Dogtiti/dsh-provider-icons) | Provider logos next to model names |
 
 ## License
 

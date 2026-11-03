@@ -329,10 +329,10 @@ src/runners/claude.js claude -p adapter
 | 插件 | 说明 |
 | --- | --- |
 | **dsh-subagent-bridge**（本仓库） | 让 Codex 把 DSH 当 subagent 用，DSH 也能派给 Codex / Claude Code |
-| [dsh-plugin-composer-predict](https://github.com/Dogtiti/dsh-plugin-composer-predict) | 预测下一条指令并显示为占位文字，`Tab` 采纳 |
-| [dsh-plugin-composer-history](https://github.com/Dogtiti/dsh-plugin-composer-history) | 输入框中按 `↑` / `↓` 回填历史消息 |
-| [dsh-plugin-usage-panel](https://github.com/Dogtiti/dsh-plugin-usage-panel) | 在模型选择器旁显示供应商额度余量 |
-| [dsh-plugin-provider-icons](https://github.com/Dogtiti/dsh-plugin-provider-icons) | 在模型名旁显示供应商品牌 logo |
+| [dsh-predict](https://github.com/Dogtiti/dsh-predict) | 预测下一条指令并显示为占位文字，`Tab` 采纳 |
+| [dsh-input-history](https://github.com/Dogtiti/dsh-input-history) | 输入框中按 `↑` / `↓` 回填历史消息 |
+| [dsh-quota-meter](https://github.com/Dogtiti/dsh-quota-meter) | 在模型选择器旁显示供应商额度余量 |
+| [dsh-provider-icons](https://github.com/Dogtiti/dsh-provider-icons) | 在模型名旁显示供应商品牌 logo |
 
 ## 许可
 
