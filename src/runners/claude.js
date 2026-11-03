@@ -145,7 +145,9 @@ export function parseClaudeOutput(stdout) {
     if (!candidate.startsWith('{') || !candidate.endsWith('}')) continue
     try {
       const parsed = JSON.parse(candidate)
-      if (typeof parsed === 'object' && parsed !== null && typeof parsed.type === 'string') {
+      /* Only the result envelope carries the answer: `system` and `assistant` events also
+       * have a `type`, and taking one of those would report a success-shaped empty answer. */
+      if (typeof parsed === 'object' && parsed !== null && parsed.type === 'result') {
         payload = parsed
         break
       }

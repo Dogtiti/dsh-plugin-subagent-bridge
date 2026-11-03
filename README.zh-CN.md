@@ -223,7 +223,7 @@ worker 真的提问时，`dsh_wait` 会把问题带出来：
 | `taskTimeoutSeconds` | `300` | `dsh_task` 等待上限（客户端可覆盖，最大 240） |
 | `assumeDefaults` | `true` | 追加「自行决策」指令 |
 | `assumptionPolicy` | 空 | 替换指令正文；空表示用内置英文默认 |
-| `workersFile` | `~/.dsh/bridge/workers.json` | worker 注册表（`0600`） |
+| `workersFile` | `~/.dsh/bridge/workers.json` | worker 注册表（`0600`）；先写临时文件再 rename，崩溃不会写坏 |
 | `maxHops` | `1` | 委派深度上限 |
 | `dispatchPerMinute` | `10` | 每个窗口允许的派发次数 |
 | `dispatchWindowMs` | `60000` | 窗口长度 |

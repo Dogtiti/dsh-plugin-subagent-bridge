@@ -2,8 +2,11 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { EventEmitter } from 'node:events'
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
-import { createApi, createBridgeServer, handleJsonRpc, pendingQuestion, parseCodexOutput, resolveCodex, runCodex, parseClaudeOutput, runClaude } from '../index.js'
+import { createApi, createBridgeServer, handleJsonRpc, pendingQuestion, parseCodexOutput, resolveCodex, runCodex, parseClaudeOutput, runClaude, saveWorkers } from '../index.js'
 
 const SESSION_ID = 'session-test'
 const TOKEN = 'k'.repeat(32)
@@ -1442,4 +1445,77 @@ test('a timed-out run takes the whole process group down', async () => {
   } finally {
     process.kill = original
   }
+})
+
+test('the registry is replaced atomically and leaves no temporary file', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-atomic-'))
+  try {
+    const settings = { workersFile: join(dir, 'workers.json'), maxResultChars: 100, workerTtlMs: 1000 }
+    const state = { workers: new Map(), baselines: new Map() }
+    state.workers.set('w1', { taskName: 'w1', sessionId: 's1', status: 'open', createdAt: 1, updatedAt: 1 })
+    await saveWorkers(settings, state)
+    state.workers.set('w2', { taskName: 'w2', sessionId: 's2', status: 'open', createdAt: 2, updatedAt: 2 })
+    await saveWorkers(settings, state)
+    const parsed = JSON.parse(await readFile(settings.workersFile, 'utf8'))
+    assert.equal(parsed.workers.length, 2)
+    const leftovers = (await readdir(dir)).filter((name) => name.includes('.tmp-'))
+    assert.deepEqual(leftovers, [])
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('a failed registry write warns instead of vanishing', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-fail-'))
+  const warnings = []
+  const original = console.warn
+  console.warn = (message) => warnings.push(String(message))
+  try {
+    /* A file where the directory should be makes mkdir fail. */
+    await writeFile(join(dir, 'blocker'), 'x')
+    const settings = { workersFile: join(dir, 'blocker', 'workers.json'), maxResultChars: 100, workerTtlMs: 1000 }
+    const state = { workers: new Map([['w', { taskName: 'w', sessionId: 's', status: 'open', createdAt: 1, updatedAt: 1 }]]), baselines: new Map() }
+    await saveWorkers(settings, state)
+    assert.equal(warnings.length, 1)
+    assert.match(warnings[0], /could not save/)
+  } finally {
+    console.warn = original
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('a Claude stream of system events is not a successful answer', async () => {
+  const stdout = [
+    JSON.stringify({ type: 'system', subtype: 'init', session_id: 's1' }),
+    JSON.stringify({ type: 'system', subtype: 'hook', session_id: 's1' }),
+  ].join('\n')
+  const parsed = parseClaudeOutput(stdout)
+  assert.equal(parsed.text, '')
+  assert.match(String(parsed.error), /no result envelope/)
+
+  const spawnImpl = (bin, args, options) => {
+    const child = new EventEmitter()
+    child.pid = 7
+    child.stdout = new EventEmitter()
+    child.stderr = new EventEmitter()
+    child.kill = () => {}
+    setTimeout(() => {
+      child.stdout.emit('data', stdout)
+      child.emit('close', 0)
+    }, 0)
+    return child
+  }
+  const result = await runClaude({ bin: '/fake/claude', prompt: 'x', timeoutMs: 2000, spawnImpl })
+  assert.equal(result.ok, false, 'system events must not count as success')
+  assert.equal(result.text, '')
+})
+
+test('the result envelope wins over system events in the same stream', async () => {
+  const stdout = [
+    JSON.stringify({ type: 'system', subtype: 'init', session_id: 's1' }),
+    JSON.stringify({ type: 'result', subtype: 'success', result: '最终答案', session_id: 's1' }),
+  ].join('\n')
+  const parsed = parseClaudeOutput(stdout)
+  assert.equal(parsed.text, '最终答案')
+  assert.equal(parsed.error, undefined)
 })

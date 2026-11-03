@@ -221,7 +221,7 @@ Returns `{ ok, text, sessionId, durationMs }`. Runs `claude -p --output-format j
 | `taskTimeoutSeconds` | `300` | `dsh_task` wait cap (client may override, max 240) |
 | `assumeDefaults` | `true` | Append the decide-and-continue instruction |
 | `assumptionPolicy` | *(empty)* | Replacement text for the instruction; empty uses the built-in English default |
-| `workersFile` | `~/.dsh/bridge/workers.json` | Worker registry (`0600`) |
+| `workersFile` | `~/.dsh/bridge/workers.json` | Worker registry (`0600`), written to a temp file and renamed so a crash cannot truncate it |
 | `maxHops` | `1` | Delegation depth limit |
 | `dispatchPerMinute` | `10` | Dispatches allowed per window |
 | `dispatchWindowMs` | `60000` | Window length |

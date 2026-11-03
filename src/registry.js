@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { MAX_PERSISTED_WORKERS } from './constants.js'
 import { text } from './utils.js'
@@ -14,14 +14,21 @@ export function saveWorkers(settings, state) {
   const payload = {
     version: 1,
     workers: [...state.workers.values()],
-    baselines: Object.fromEntries(state.baseline),
+    baselines: Object.fromEntries(state.baseline ?? new Map()),
   }
   const write = async () => {
+    /* Write beside the target and rename: a crash mid-write must not leave a truncated
+     * registry that the next boot would read as "no workers". */
+    const temporary = `${settings.workersFile}.tmp-${String(process.pid)}-${String((state.saves = (state.saves ?? 0) + 1))}`
     try {
       await mkdir(dirname(settings.workersFile), { recursive: true, mode: 0o700 })
-      await writeFile(settings.workersFile, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 })
-    } catch {
-      /* Persistence is best effort: a failed write must not break a dispatch. */
+      await writeFile(temporary, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 })
+      await rename(temporary, settings.workersFile)
+    } catch (error) {
+      /* Persistence is best effort: a failed write must not break a dispatch, but a silent
+       * one loses the registry on the next boot, so say it out loud. */
+      console.warn(`subagent-bridge: could not save ${settings.workersFile}: ${String(error?.message ?? error)}`)
+      await rm(temporary, { force: true }).catch(() => {})
     }
   }
   state.saving = (state.saving ?? Promise.resolve()).then(write, write)
