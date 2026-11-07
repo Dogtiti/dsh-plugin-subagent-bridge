@@ -21,23 +21,30 @@ export function lastTurn(ctx, sessionId) {
  * @returns the `turn/end` payload, or undefined on timeout.
  */
 
-export function waitForTurnEnd(ctx, sessionId, afterTurn, timeoutMs) {
+export function waitForTurnEnd(ctx, sessionId, afterTurn, timeoutMs, signal) {
   return new Promise((resolve) => {
     let settled = false
+    let timer
+    let off = () => {}
+    const abort = () => finish(undefined)
     const finish = (value) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
       off()
+      signal?.removeEventListener('abort', abort)
       resolve(value)
     }
-    const off = ctx.on('session/event', (session, event) => {
+    off = ctx.on('session/event', (session, event) => {
       if (session?.id !== sessionId) return
       if (event?.type !== 'turn/end') return
       if (Number(event.data?.turn) <= afterTurn) return
       finish(event.data)
-    })
-    const timer = setTimeout(() => finish(undefined), Math.max(1000, timeoutMs))
+    }) ?? (() => {})
+    if (settled) return off()
+    timer = setTimeout(() => finish(undefined), Math.max(1000, timeoutMs))
+    if (signal?.aborted) finish(undefined)
+    else signal?.addEventListener('abort', abort, { once: true })
   })
 }
 

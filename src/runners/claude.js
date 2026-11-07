@@ -1,10 +1,10 @@
 import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { CLAUDE_CANDIDATES } from '../constants.js'
 import { expandHome } from '../settings.js'
 import { ok, text } from '../utils.js'
+import { runChild } from './process.js'
 
 export function resolveClaude(configured) {
   const configuredValue = typeof configured === 'string' ? configured : ''
@@ -53,58 +53,7 @@ export async function runClaude({
   if (typeof resume === 'string' && resume !== '') args.unshift('--resume', resume)
   if (typeof model === 'string' && model !== '') args.push('--model', model)
 
-  const outcome = await new Promise((resolve) => {
-    let child
-    try {
-      child = spawnImpl(bin, args, { cwd: cwd ?? homedir(), stdio: ['ignore', 'pipe', 'pipe'], detached: true })
-    } catch (error) {
-      resolve({ exitCode: -1, stdout: '', stderr: String(error), error: String(error) })
-      return
-    }
-    children?.add(child)
-    let stdout = ''
-    let stderr = ''
-    let settled = false
-    const finish = (value) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      signal?.removeEventListener?.('abort', abort)
-      children?.delete(child)
-      resolve(value)
-    }
-    const signalGroup = (signal) => {
-      /* The group id is the child's pid because spawning detached made it a leader. */
-      try {
-        process.kill(-child.pid, signal)
-        return
-      } catch {
-        /* No group (or it is already gone): fall back to the child itself. */
-      }
-      try {
-        child.kill(signal)
-      } catch {
-        /* Already gone. */
-      }
-    }
-    const kill = (reason) => {
-      signalGroup('SIGTERM')
-      setTimeout(() => signalGroup('SIGKILL'), 5000).unref?.()
-      finish({ exitCode: -1, stdout, stderr, error: reason })
-    }
-    const timer = setTimeout(() => kill(`claude timed out after ${timeoutMs} ms`), Math.max(1000, timeoutMs ?? 300000))
-    const abort = () => kill('cancelled by the caller')
-    if (signal?.aborted === true) abort()
-    else signal?.addEventListener?.('abort', abort)
-    child.stdout?.on('data', (chunk) => {
-      stdout += chunk.toString('utf8')
-    })
-    child.stderr?.on('data', (chunk) => {
-      stderr += chunk.toString('utf8')
-    })
-    child.on('error', (error) => finish({ exitCode: -1, stdout, stderr, error: error.message }))
-    child.on('close', (code) => finish({ exitCode: code ?? -1, stdout, stderr }))
-  })
+  const outcome = await runChild({ bin, args, cwd, timeoutMs, signal, children, spawnImpl, label: 'claude' })
 
   const parsed = parseClaudeOutput(outcome.stdout)
   const durationMs = Date.now() - started
@@ -116,7 +65,7 @@ export async function runClaude({
     ...(parsed.sessionId === undefined ? {} : { sessionId: parsed.sessionId }),
     ...(error === undefined ? {} : { error }),
   })
-  if (outcome.error !== undefined) return build(false, outcome.error)
+  if (outcome.error !== undefined) return build(false, `${outcome.error}${outcome.terminationWarning === undefined ? '' : `; ${outcome.terminationWarning}`}`)
   if (parsed.error !== undefined) return build(false, parsed.error)
   if (outcome.exitCode !== 0) {
     const detail = outcome.stderr.trim().split('\n').slice(-3).join('\n')
@@ -138,7 +87,7 @@ export function parseClaudeOutput(stdout) {
    * same stream, and those lines can carry braces of their own. Parse whole output first,
    * then scan lines backwards for the envelope that carries a result. */
   const lines = raw.split('\n').map((line) => line.trim()).filter((line) => line !== '')
-  const candidates = [...lines].reverse()
+  const candidates = [raw, ...[...lines].reverse()]
   let payload
   let lastError
   for (const candidate of candidates) {
@@ -147,12 +96,15 @@ export function parseClaudeOutput(stdout) {
       const parsed = JSON.parse(candidate)
       /* Only the result envelope carries the answer: `system` and `assistant` events also
        * have a `type`, and taking one of those would report a success-shaped empty answer. */
-      if (typeof parsed === 'object' && parsed !== null && parsed.type === 'result') {
+      if (typeof parsed === 'object' && parsed !== null && parsed.type === 'result'
+        && (typeof parsed.result === 'string' || parsed.is_error === true
+          || (typeof parsed.subtype === 'string' && parsed.subtype !== 'success'))) {
         payload = parsed
         break
       }
     } catch (error) {
-      lastError = error
+      // A JSONL stream is not one JSON object; let its individual lines diagnose errors.
+      if (candidate !== raw || lines.length === 1) lastError = error
     }
   }
   if (payload === undefined) {

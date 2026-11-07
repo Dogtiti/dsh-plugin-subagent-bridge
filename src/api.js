@@ -15,11 +15,86 @@ export function createApi(ctx, state, settings) {
   /* Callers may hand in a bare bookkeeping object; fill in what the api needs. */
   state.dispatched = state.dispatched ?? new Set()
   state.baseline = state.baseline ?? new Map()
+  state.readFloor ??= new Map()
+  state.pendingDispatch ??= new Set()
   state.workers = state.workers ?? new Map()
   state.chain = state.chain ?? { depth: 0, active: 0, until: 0 }
   state.recent = state.recent ?? []
+  state.onPersistenceError ??= (message) => {
+    if (ctx.logger?.warn !== undefined) ctx.logger.warn(message)
+    else console.warn(message)
+  }
   const controller = () => ctx.get('sessionController')
   const sessions = () => ctx.get('sessions')
+  const warning = () => state.persistenceError === undefined ? {} : { persistenceWarning: state.persistenceError }
+  const markDispatched = (sessionId, before) => {
+    state.dispatched.add(sessionId)
+    state.baseline.set(sessionId, before)
+    const floor = state.readFloor.get(sessionId)
+    state.readFloor.set(sessionId, floor === undefined ? before : Math.min(floor, before))
+  }
+  const claimDispatch = (sessionId) => {
+    if (state.pendingDispatch.has(sessionId) || resolveWorker(state, sessionId)?.record?.dispatchState === 'dispatching') throw new Error(`a dispatch to ${sessionId} is still being accepted; inspect it before retrying`)
+    state.pendingDispatch.add(sessionId)
+    return () => state.pendingDispatch.delete(sessionId)
+  }
+  const newRecord = (sessionId, root, taskName, countsTowardLimit = false) => {
+    const baseName = taskName ?? `task_${sessionId.slice('session-'.length, 'session-'.length + 8)}`
+    if (taskName !== undefined && state.workers.has(taskName)) throw new Error(`task_name ${JSON.stringify(taskName)} is already in use`)
+    let name = baseName
+    for (let suffix = 2; state.workers.has(name) || (taskName === undefined && state.reserved?.has(name)); suffix += 1) name = `${baseName}_${suffix}`
+    return { taskName: name, sessionId, status: 'open', countsTowardLimit, root, createdAt: Date.now(), updatedAt: Date.now() }
+  }
+  /* Record intent before sending. A lost response is not proof the Host rejected a prompt. */
+  const prepareDispatch = (record, before, kind, mode, previousRecord) => {
+    const sessionId = record.sessionId
+    const previous = {
+      record: previousRecord,
+      dispatched: state.dispatched.has(sessionId),
+      baseline: state.baseline.get(sessionId),
+      floor: state.readFloor.get(sessionId),
+    }
+    const operation = beginOperation(state, { sessionId, requestId: randomUUID(), kind, mode, seqStart: before })
+    operation.status = 'dispatching'
+    delete record.outcome
+    delete record.dispatchError
+    Object.assign(record, { requestId: operation.requestId, operationId: operation.operationId, dispatchState: 'dispatching', updatedAt: Date.now() })
+    state.workers.set(record.taskName, record)
+    markDispatched(sessionId, before)
+    const rollback = (status = 'rejected') => {
+      /* A concurrent close wins over the state captured before the request. */
+      const closed = record.status === 'closed'
+      if (previous.record === undefined) state.workers.delete(record.taskName)
+      else {
+        for (const key of Object.keys(record)) delete record[key]
+        Object.assign(record, previous.record)
+        if (closed) { record.status = 'closed'; record.updatedAt = Date.now() }
+      }
+      if (!previous.dispatched) state.dispatched.delete(sessionId)
+      for (const [map, value] of [[state.baseline, previous.baseline], [state.readFloor, previous.floor]]) {
+        if (value === undefined) map.delete(sessionId)
+        else map.set(sessionId, value)
+      }
+      finishOperation(operation, { status })
+    }
+    const unknown = async (error) => {
+      record.dispatchState = 'unknown'
+      record.dispatchError = String(error?.message ?? error)
+      record.updatedAt = Date.now()
+      finishOperation(operation, { status: 'unknown' })
+      await saveWorkers(settings, state)
+      return new Error(`dispatch outcome is unknown for session ${sessionId}, request ${operation.requestId}; inspect it before retrying: ${record.dispatchError}`)
+    }
+    const accepted = (result) => {
+      if (result?.accepted === false) rollback()
+      else {
+        record.dispatchState = result?.accepted === true ? 'accepted' : 'unknown'
+        record.updatedAt = Date.now()
+        finishOperation(operation, { status: record.dispatchState })
+      }
+    }
+    return { operation, rollback, unknown, accepted }
+  }
 
   return {
     async listSessions() {
@@ -48,82 +123,54 @@ export function createApi(ctx, state, settings) {
     async spawn({ taskName, message, forkTurns, from, cwd, model, reasoningEffort, workspace, mode }) {
       const service = controller()
       if (service === undefined || service === null) throw new Error('session controller is unavailable')
-      /* Older callers build a minimal state object; keep the reservation map optional. */
       state.reserved ??= new Map()
-      if (state.workers.has(taskName) || state.reserved.has(taskName)) {
-        throw new Error(`task_name ${JSON.stringify(taskName)} is already in use`)
-      }
+      if (state.workers.has(taskName) || state.reserved.has(taskName)) throw new Error(`task_name ${JSON.stringify(taskName)} is already in use`)
       const root = typeof cwd === 'string' && cwd !== '' ? cwd : forkTurns === 'all' ? `fork:${String(from)}` : '(default)'
       guardDepth(state, settings, 0, 'dsh_spawn')
-      /* Everything from here to the registry write awaits, so claim the name and the slot
-       * synchronously: two concurrent spawns must not both clear the checks above. */
       state.reserved.set(taskName, root)
       try {
         assertCapacity(state, settings, root, taskName)
         takeDispatchSlot(state, settings)
-
         let placed
         let sessionId
         if (forkTurns === 'all') {
-          const parent = sessions()?.get?.(from)
-          if (parent === undefined || parent === null) {
-            /* Forking a cold session is fine: the controller reads it from storage. */
-          }
-          const forked = await service.fork({ sessionId: from })
-          sessionId = forked?.sessionId
+          sessionId = (await service.fork({ sessionId: from }))?.sessionId
           if (typeof sessionId !== 'string' || sessionId === '') throw new Error('forking returned no session id')
         } else {
-          const opened = await service.create(cwd === undefined ? {} : { cwd })
-          sessionId = opened?.sessionId
-          if (typeof sessionId === 'string' && sessionId !== '') {
-            placed = await attachToWorkspace(ctx, sessionId, cwd ?? undefined, workspaceOptions(workspace))
-          }
+          sessionId = (await service.create(cwd === undefined ? {} : { cwd }))?.sessionId
           if (typeof sessionId !== 'string' || sessionId === '') throw new Error('session controller did not return a session id')
+          placed = await attachToWorkspace(ctx, sessionId, cwd, workspaceOptions(workspace))
         }
-
         const appliedModel = await applyModelSpec(ctx, sessionId, model, reasoningEffort)
         attachQuestionAnswerer(state, ctx.get('agents')?.get?.(sessionId))
         const before = Number(sessions()?.get?.(sessionId)?.seq ?? 0)
-        const requestId = randomUUID()
-        const accepted = await service.prompt(
-          { sessionId, requestId, mode: mode === 'steer' ? 'steer' : 'queue', content: [{ type: 'text', text: withAssumptionPolicy(settings, message) }] },
-          AbortSignal.timeout(30000),
-        )
-        state.dispatched.add(sessionId)
-        state.baseline.set(sessionId, before)
-        const spawnedOperation = beginOperation(state, {
-          sessionId,
-          requestId,
-          kind: 'spawn',
-          mode: mode === 'steer' ? 'steer' : 'queue',
-          seqStart: before,
-        })
-        finishOperation(spawnedOperation, { status: 'accepted' })
-        state.workers.set(taskName, {
-          taskName,
-          sessionId,
-          status: 'open',
-          countsTowardLimit: true,
-          root,
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-        })
+        const deliveryMode = mode === 'steer' ? 'steer' : 'queue'
+        const record = newRecord(sessionId, root, taskName, true)
+        const transaction = prepareDispatch(record, before, 'spawn', deliveryMode)
+        /* The registry now holds the slot; do not count the reservation twice. */
+        state.reserved.delete(taskName)
+        await saveWorkers(settings, state)
+        if (record.status === 'closed') {
+          transaction.rollback('cancelled')
+          await saveWorkers(settings, state)
+          throw new Error('that worker was closed before dispatch')
+        }
+        let accepted
+        try {
+          accepted = await service.prompt(
+            { sessionId, requestId: transaction.operation.requestId, mode: deliveryMode, content: [{ type: 'text', text: withAssumptionPolicy(settings, message) }] },
+            AbortSignal.timeout(30000),
+          )
+        } catch (error) { throw await transaction.unknown(error) }
+        transaction.accepted(accepted)
         await saveWorkers(settings, state)
         return {
-          task_name: taskName,
-          sessionId,
-          accepted: accepted?.accepted === true,
-          fork_turns: forkTurns,
+          task_name: taskName, sessionId, accepted: accepted?.accepted === true, fork_turns: forkTurns,
           ...(appliedModel === undefined ? {} : { model: appliedModel }),
           ...(placed === undefined ? {} : { workspace: placed }),
-          operationId: spawnedOperation.operationId,
-          requestId,
-          seqStart: before,
+          ...operationReport(transaction.operation), ...warning(),
         }
-      } finally {
-        /* Released on success too: the worker record now holds the slot. */
-        state.reserved.delete(taskName)
-      }
+      } finally { state.reserved.delete(taskName) }
     },
 
     async followup({ worker, message, model, reasoningEffort, mode }) {
@@ -131,52 +178,49 @@ export function createApi(ctx, state, settings) {
       if (target === undefined) throw new Error(`unknown worker ${JSON.stringify(worker)}`)
       const service = controller()
       if (service === undefined || service === null) throw new Error('session controller is unavailable')
-      /* A closed worker keeps its session, so reopening is useful — but it has to pay for a
-       * slot again, otherwise "closed" would be a way to run work outside the budget. */
-      if (target.record?.status === 'closed') {
-        state.reserved ??= new Map()
-        const reservation = target.record.taskName ?? target.sessionId
-        const root = target.record.root ?? '(default)'
-        state.reserved.set(reservation, root)
-        try {
-          assertCapacity(state, settings, root, reservation)
-        } finally {
-          state.reserved.delete(reservation)
+      const release = claimDispatch(target.sessionId)
+      const existing = target.record
+      const previous = existing === undefined ? undefined : { ...existing }
+      const record = existing ?? newRecord(target.sessionId, '(default)')
+      let transaction
+      try {
+        /* Retain main's reopen behavior, but roll it back if no prompt is accepted. */
+        if (record.status === 'closed' && record.countsTowardLimit !== false) assertCapacity(state, settings, record.root ?? '(default)')
+        takeDispatchSlot(state, settings)
+        record.status = 'open'
+        record.updatedAt = Date.now()
+        const appliedModel = await applyModelSpec(ctx, target.sessionId, model, reasoningEffort)
+        if (record.status === 'closed') throw new Error('that worker was closed before dispatch')
+        const before = Number(sessions()?.get?.(target.sessionId)?.seq ?? 0)
+        const deliveryMode = mode === 'steer' ? 'steer' : 'queue'
+        transaction = prepareDispatch(record, before, 'followup', deliveryMode, previous)
+        await saveWorkers(settings, state)
+        if (record.status === 'closed') {
+          transaction.rollback('cancelled')
+          await saveWorkers(settings, state)
+          throw new Error('that worker was closed before dispatch')
         }
-        target.record.status = 'open'
-      }
-      takeDispatchSlot(state, settings)
-      const appliedModel = await applyModelSpec(ctx, target.sessionId, model, reasoningEffort)
-      const before = Number(sessions()?.get?.(target.sessionId)?.seq ?? 0)
-      const requestId = randomUUID()
-      const accepted = await service.prompt(
-        { sessionId: target.sessionId, requestId, mode: mode === 'steer' ? 'steer' : 'queue', content: [{ type: 'text', text: withAssumptionPolicy(settings, message) }] },
-        AbortSignal.timeout(30000),
-      )
-      state.baseline.set(target.sessionId, before)
-      const operation = beginOperation(state, {
-        sessionId: target.sessionId,
-        requestId,
-        kind: 'followup',
-        mode: mode === 'steer' ? 'steer' : 'queue',
-        seqStart: before,
-      })
-      finishOperation(operation, { status: 'accepted' })
-      const report = { operationId: operation.operationId, requestId, seqStart: before }
-      if (target.record !== undefined) {
-        /* A new turn invalidates the cached answer. */
-        delete target.record.outcome
-        target.record.updatedAt = Date.now()
-        target.record.operationId = operation.operationId
-      }
-      await saveWorkers(settings, state)
-      return {
-        worker: target.taskName ?? target.sessionId,
-        sessionId: target.sessionId,
-        accepted: accepted?.accepted === true,
-        ...(appliedModel === undefined ? {} : { model: appliedModel }),
-        ...report,
-      }
+        let accepted
+        try {
+          accepted = await service.prompt(
+            { sessionId: target.sessionId, requestId: transaction.operation.requestId, mode: deliveryMode, content: [{ type: 'text', text: withAssumptionPolicy(settings, message) }] },
+            AbortSignal.timeout(30000),
+          )
+        } catch (error) { throw await transaction.unknown(error) }
+        transaction.accepted(accepted)
+        await saveWorkers(settings, state)
+        return {
+          worker: target.taskName ?? target.sessionId, sessionId: target.sessionId, accepted: accepted?.accepted === true,
+          ...(appliedModel === undefined ? {} : { model: appliedModel }),
+          ...operationReport(transaction.operation), ...warning(),
+        }
+      } catch (error) {
+        if (transaction === undefined && previous !== undefined && record.status !== 'closed') {
+          Object.assign(record, previous)
+          await saveWorkers(settings, state)
+        }
+        throw error
+      } finally { release() }
     },
 
     async close({ worker }) {
@@ -195,115 +239,97 @@ export function createApi(ctx, state, settings) {
       for (const record of state.workers.values()) {
         const status = record.status === 'closed' ? 'closed' : workerStatus(ctx, record.sessionId, state, settings)
         if (record.status !== 'closed') await rememberOutcome(settings, state, record.sessionId, status)
-        rows.push({ task_name: record.taskName, sessionId: record.sessionId, root: record.root ?? '(default)', status })
+        rows.push({
+          task_name: record.taskName, sessionId: record.sessionId, root: record.root ?? '(default)', status,
+          ...(record.dispatchState === 'unknown' || record.dispatchState === 'dispatching'
+            ? { dispatchState: record.dispatchState, requestId: record.requestId, operationId: record.operationId,
+                ...(record.dispatchError === undefined ? {} : { dispatchError: record.dispatchError }) } : {}),
+          ...warning(),
+        })
       }
       return rows
     },
 
-    async task({ prompt, cwd, sessionId, agentPreset, timeoutSeconds, model, reasoningEffort, workspace, mode }) {
+    async task({ prompt, cwd, sessionId, agentPreset, timeoutSeconds, model, reasoningEffort, workspace, mode, signal }) {
       const service = controller()
       if (service === undefined || service === null) throw new Error('session controller is unavailable')
-      const seconds = Math.min(
-        MAX_BLOCKING_SECONDS,
-        Math.max(1, Number.isFinite(timeoutSeconds) ? timeoutSeconds : settings.taskTimeoutSeconds),
-      )
+      if (signal?.aborted) throw new Error('caller cancelled before dispatch')
+      const seconds = Math.min(MAX_BLOCKING_SECONDS,
+        Math.max(1, Number.isFinite(timeoutSeconds) ? timeoutSeconds : Number.isFinite(settings.taskTimeoutSeconds) ? settings.taskTimeoutSeconds : MAX_BLOCKING_SECONDS))
       guardDepth(state, settings, 0, 'dsh_task')
       takeDispatchSlot(state, settings)
       const started = Date.now()
-
       let placed
       let targetId = sessionId
-      let created = false
-      if (targetId === undefined) {
-        const opened = await service.create(cwd === undefined ? {} : { cwd })
-        targetId = opened?.sessionId
-        if (typeof targetId === 'string' && targetId !== '') {
-          placed = await attachToWorkspace(ctx, targetId, cwd ?? undefined, workspaceOptions(workspace))
-        }
+      const created = targetId === undefined
+      if (created) {
+        targetId = (await service.create(cwd === undefined ? {} : { cwd }))?.sessionId
         if (typeof targetId !== 'string' || targetId === '') throw new Error('session controller did not return a session id')
-        created = true
+        placed = await attachToWorkspace(ctx, targetId, cwd, workspaceOptions(workspace))
       } else if (mode !== 'steer' && ctx.get('agents')?.get?.(targetId)?.status === 'running') {
-        /* Steering exists precisely to reach a running session; queueing into one would
-         * silently wait for a turn this call is not tracking. */
         throw new Error('that session is running; pass mode:"steer" to insert into that turn, or use dsh_dispatch plus dsh_read_result')
       }
-
-      const appliedModel = await applyModelSpec(ctx, targetId, model, reasoningEffort)
-      /* DSH delivers a prompt either queued behind the running turn or steered into it. */
+      const release = claimDispatch(targetId)
+      const existing = resolveWorker(state, targetId)?.record
+      const record = existing ?? newRecord(targetId, typeof cwd === 'string' && cwd !== '' ? cwd : '(default)')
       const deliveryMode = mode === 'steer' ? 'steer' : 'queue'
-      attachQuestionAnswerer(state, ctx.get('agents')?.get?.(targetId))
-      const turnBefore = lastTurn(ctx, targetId)
-      /* A steered message is absorbed by the turn that is already running, so waiting for
-       * a strictly newer turn would hang until the timeout even after the answer landed. */
-      const waitAfter = deliveryMode === 'steer' ? Math.max(0, turnBefore - 1) : turnBefore
-      const before = Number(sessions()?.get?.(targetId)?.seq ?? 0)
-      const finished = waitForTurnEnd(ctx, targetId, waitAfter, seconds * 1000)
-      const requestId = randomUUID()
-      const operation = beginOperation(state, {
-        sessionId: targetId,
-        requestId,
-        kind: created ? 'task' : 'task-continue',
-        mode: deliveryMode,
-        seqStart: before,
-      })
-      const accepted = await service.prompt(
-        { sessionId: targetId, requestId, mode: deliveryMode, content: [{ type: 'text', text: withAssumptionPolicy(settings, prompt) }] },
-        AbortSignal.timeout(30000),
-      )
-      state.dispatched.add(targetId)
-      state.baseline.set(targetId, before)
-      /* A blocking task is not a spawned worker: it is recorded for later lookup but
-       * must not consume one of the concurrency slots. */
-      const implicitName = `task_${targetId.slice('session-'.length, 'session-'.length + 8)}`
-      if (!state.workers.has(implicitName)) {
-        state.workers.set(implicitName, {
-          taskName: implicitName,
-          sessionId: targetId,
-          status: 'open',
-          countsTowardLimit: false,
-          root: typeof cwd === 'string' && cwd !== '' ? cwd : '(default)',
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-        })
+      let appliedModel, transaction, before, finished, accepted
+      const waitController = new AbortController()
+      try {
+        if (record.status === 'closed') throw new Error('that worker is closed; reopen it with dsh_followup')
+        appliedModel = await applyModelSpec(ctx, targetId, model, reasoningEffort)
+        if (signal?.aborted) throw new Error('caller cancelled before dispatch')
+        if (record.status === 'closed') throw new Error('that worker was closed before dispatch')
+        attachQuestionAnswerer(state, ctx.get('agents')?.get?.(targetId))
+        const turnBefore = lastTurn(ctx, targetId)
+        const waitAfter = deliveryMode === 'steer' ? Math.max(0, turnBefore - 1) : turnBefore
+        before = Number(sessions()?.get?.(targetId)?.seq ?? 0)
+        transaction = prepareDispatch(record, before, created ? 'task' : 'task-continue', deliveryMode, existing === undefined ? undefined : { ...existing })
         await saveWorkers(settings, state)
-      }
-
+        if (signal?.aborted || record.status === 'closed') {
+          transaction.rollback('cancelled')
+          await saveWorkers(settings, state)
+          throw new Error(signal?.aborted ? 'caller cancelled before dispatch' : 'that worker was closed before dispatch')
+        }
+        const waitSignal = signal === undefined ? waitController.signal : AbortSignal.any([signal, waitController.signal])
+        finished = waitForTurnEnd(ctx, targetId, waitAfter, seconds * 1000, waitSignal)
+        try {
+          const promptSignal = signal === undefined ? AbortSignal.timeout(30000) : AbortSignal.any([signal, AbortSignal.timeout(30000)])
+          accepted = await service.prompt(
+            { sessionId: targetId, requestId: transaction.operation.requestId, mode: deliveryMode, content: [{ type: 'text', text: withAssumptionPolicy(settings, prompt) }] },
+            promptSignal,
+          )
+        } catch (error) { throw await transaction.unknown(error) }
+        transaction.accepted(accepted)
+        if (accepted?.accepted === false) waitController.abort()
+        await saveWorkers(settings, state)
+      } catch (error) {
+        waitController.abort()
+        throw error
+      } finally { release() }
       const end = await finished
-      /* A steered reply lives inside the turn that was already running, so anchor the
-       * answer on the message we delivered instead of the turn's last assistant text. */
       const answerFrom = deliveryMode === 'steer' ? firstDeliveredMessageSeq(ctx, targetId, before) : before
-      const collected = finalAnswer(ctx, targetId, answerFrom, settings)
+      const collected = accepted?.accepted === false ? { text: '', truncated: false } : finalAnswer(ctx, targetId, answerFrom, settings)
       const turnReason = end?.reason?.kind ?? null
-      const durationMs = Date.now() - started
-      const status = end === undefined ? 'timeout' : turnReason === 'completed' ? 'completed' : `turn-${String(turnReason)}`
+      const status = accepted?.accepted === false ? 'not-accepted' : end === undefined ? (signal?.aborted ? 'cancelled' : 'timeout') : turnReason === 'completed' ? 'completed' : `turn-${String(turnReason)}`
+      const report = operationReport(finishOperation(transaction.operation, {
+        status, seqEnd: Number(sessions()?.get?.(targetId)?.seq ?? 0), text: collected.text,
+        model: modelInWindow(ctx, targetId, before), usage: sumUsage(ctx, targetId, before),
+      }))
       return {
-        sessionId: targetId,
-        created,
-        status,
-        /* A timeout means "still running": say so, and say what to call next. */
-        ...(status === 'timeout'
-          ? {
-              running: true,
-              next: `the worker is still running; do not end the turn. Call dsh_wait({targets:["${targetId}"],timeoutMs:${String(MAX_BLOCKING_SECONDS * 1000)}}) and repeat until it is not "running".`,
-            }
-          : {}),
-        /* The operation report comes first so the caller's explicit model selection keeps its
-         * established shape below. */
-        ...operationReport(finishOperation(operation, {
-          status,
-          seqEnd: Number(sessions()?.get?.(targetId)?.seq ?? 0),
-          text: collected.text,
-          model: modelInWindow(ctx, targetId, before),
-          usage: sumUsage(ctx, targetId, before),
-        })),
+        sessionId: targetId, created, status,
+        ...(status === 'timeout' ? {
+          running: true,
+          next: `the worker is still running; do not end the turn. Call dsh_wait({targets:["${targetId}"],timeoutMs:${String(MAX_BLOCKING_SECONDS * 1000)}}) and repeat until it is not "running".`,
+        } : status === 'cancelled' ? {
+          ...(ctx.get('agents')?.get?.(targetId)?.status === 'running' ? { running: true } : {}),
+          next: 'waiting was cancelled; the worker may continue. Check it with dsh_wait before retrying.',
+        } : {}),
+        ...report,
         ...(appliedModel === undefined ? {} : { model: appliedModel }),
         ...(placed === undefined ? {} : { workspace: placed }),
-        mode: deliveryMode,
-        text: collected.text,
-        truncated: collected.truncated,
-        turns: lastTurn(ctx, targetId),
-        accepted: accepted?.accepted === true,
-        durationMs,
+        mode: deliveryMode, text: collected.text, truncated: collected.truncated, turns: lastTurn(ctx, targetId),
+        accepted: accepted?.accepted === true, durationMs: Date.now() - started, ...warning(),
       }
     },
 
@@ -398,31 +424,43 @@ export function createApi(ctx, state, settings) {
       const service = controller()
       if (service === undefined || service === null) throw new Error('session controller is unavailable')
       guardDepth(state, settings, 0, 'dsh_dispatch')
-      takeDispatchSlot(state, settings)
-      const before = Number(sessions()?.get?.(sessionId)?.seq ?? 0)
-      const requestId = randomUUID()
-      const result = await service.prompt(
-        { sessionId, requestId, mode, content: [{ type: 'text', text }] },
-        AbortSignal.timeout(30000),
-      )
-      state.dispatched.add(sessionId)
-      state.baseline.set(sessionId, before)
-      const operation = beginOperation(state, { sessionId, requestId, kind: 'dispatch', mode, seqStart: before })
-      finishOperation(operation, { status: 'accepted' })
-      return {
-        accepted: result?.accepted === true,
-        sessionId,
-        requestId,
-        mode,
-        seqAtDispatch: before,
-        operationId: operation.operationId,
-      }
+      const release = claimDispatch(sessionId)
+      try {
+        const existing = resolveWorker(state, sessionId)?.record
+        const previous = existing === undefined ? undefined : { ...existing }
+        const record = existing ?? newRecord(sessionId, '(default)')
+        if (record.status === 'closed' && record.countsTowardLimit !== false) assertCapacity(state, settings, record.root ?? '(default)')
+        takeDispatchSlot(state, settings)
+        record.status = 'open'
+        const before = Number(sessions()?.get?.(sessionId)?.seq ?? 0)
+        const transaction = prepareDispatch(record, before, 'dispatch', mode, previous)
+        await saveWorkers(settings, state)
+        if (record.status === 'closed') {
+          transaction.rollback('cancelled')
+          await saveWorkers(settings, state)
+          throw new Error('that worker was closed before dispatch')
+        }
+        let result
+        try {
+          result = await service.prompt(
+            { sessionId, requestId: transaction.operation.requestId, mode, content: [{ type: 'text', text }] },
+            AbortSignal.timeout(30000),
+          )
+        } catch (error) { throw await transaction.unknown(error) }
+        transaction.accepted(result)
+        await saveWorkers(settings, state)
+        return {
+          accepted: result?.accepted === true, sessionId, mode, seqAtDispatch: before,
+          ...operationReport(transaction.operation), ...warning(),
+        }
+      } finally { release() }
     },
 
     async readResult({ sessionId, sinceSeq, waitSeconds, signal }) {
       if (!state.dispatched.has(sessionId)) {
         throw new Error('refused: this bridge has not dispatched to that session')
       }
+      sinceSeq = Math.max(Number.isFinite(sinceSeq) ? sinceSeq : 0, state.readFloor.get(sessionId) ?? state.baseline.get(sessionId) ?? 0)
       const requestedWait = waitSeconds === undefined ? settings.readWaitSeconds : waitSeconds
       const seconds = Number.isFinite(requestedWait) ? Math.max(0, requestedWait) : 0
       const budgetMs = Math.min(MAX_WAIT_SECONDS, seconds) * 1000
