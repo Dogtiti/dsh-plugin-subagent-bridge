@@ -4,6 +4,7 @@ import { MAX_PERSISTED_WORKERS } from './constants.js'
 import { text } from './utils.js'
 
 export function saveWorkers(settings, state) {
+  if (typeof settings.workersFile !== 'string' || settings.workersFile === '') return Promise.resolve()
   const records = [...state.workers.values()]
   if (records.length > MAX_PERSISTED_WORKERS) {
     const closed = records.filter((record) => record.status === 'closed').sort((left, right) => left.createdAt - right.createdAt)
@@ -11,23 +12,29 @@ export function saveWorkers(settings, state) {
     const keep = Math.max(0, MAX_PERSISTED_WORKERS - open.length)
     for (const record of closed.slice(0, Math.max(0, closed.length - keep))) state.workers.delete(record.taskName)
   }
-  const payload = {
+  const payload = JSON.stringify({
     version: 1,
     workers: [...state.workers.values()],
     baselines: Object.fromEntries(state.baseline ?? new Map()),
-  }
+    readFloors: Object.fromEntries(state.readFloor ?? new Map()),
+  }, null, 2) + '\n'
   const write = async () => {
     /* Write beside the target and rename: a crash mid-write must not leave a truncated
      * registry that the next boot would read as "no workers". */
     const temporary = `${settings.workersFile}.tmp-${String(process.pid)}-${String((state.saves = (state.saves ?? 0) + 1))}`
     try {
       await mkdir(dirname(settings.workersFile), { recursive: true, mode: 0o700 })
-      await writeFile(temporary, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 })
+      await writeFile(temporary, payload, { mode: 0o600 })
       await rename(temporary, settings.workersFile)
+      state.persistenceError = undefined
     } catch (error) {
       /* Persistence is best effort: a failed write must not break a dispatch, but a silent
        * one loses the registry on the next boot, so say it out loud. */
-      console.warn(`subagent-bridge: could not save ${settings.workersFile}: ${String(error?.message ?? error)}`)
+      state.persistenceError = `worker registry persistence failed: ${String(error?.message ?? error)}`
+      try {
+        if (state.onPersistenceError !== undefined) state.onPersistenceError(state.persistenceError)
+        else console.warn(`subagent-bridge: could not save ${settings.workersFile}: ${String(error?.message ?? error)}`)
+      } catch { /* Logging must not break a dispatch. */ }
       await rm(temporary, { force: true }).catch(() => {})
     }
   }
@@ -62,12 +69,23 @@ export async function loadWorkers(settings, state) {
       createdAt: Number(entry.createdAt ?? Date.now()),
       updatedAt: Number(entry.updatedAt ?? Date.now()),
       ...(entry.outcome === undefined ? {} : { outcome: entry.outcome }),
+      ...(typeof entry.dispatchState === 'string' ? { dispatchState: entry.dispatchState === 'dispatching' ? 'unknown' : entry.dispatchState } : {}),
+      ...(typeof entry.requestId === 'string' ? { requestId: entry.requestId } : {}),
+      ...(typeof entry.dispatchError === 'string' ? { dispatchError: entry.dispatchError } : {}),
     })
     state.dispatched.add(entry.sessionId)
   }
   for (const [sessionId, seq] of Object.entries(parsed?.baselines ?? {})) {
     const value = Number(seq)
     if (typeof sessionId === 'string' && Number.isFinite(value)) state.baseline.set(sessionId, value)
+  }
+  state.readFloor ??= new Map()
+  for (const [sessionId, seq] of state.baseline) {
+    if (Number.isFinite(seq) && seq >= 0) state.readFloor.set(sessionId, seq)
+  }
+  for (const [sessionId, seq] of Object.entries(parsed?.readFloors ?? {})) {
+    const value = Number(seq)
+    if (Number.isFinite(value) && value >= 0) state.readFloor.set(sessionId, value)
   }
 }
 

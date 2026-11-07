@@ -44,8 +44,33 @@ export function createBridgeServer({ api, token, host = '127.0.0.1', port }) {
  */
 
 export function createHandler(api, token) {
-  return async function handle(request, response) {
-    const url = new URL(request.url ?? '/', 'http://127.0.0.1')
+  return async function safeHandle(request, response) {
+    try {
+      await handle(request, response)
+    } catch {
+      if (response.destroyed || response.writableEnded) return
+      if (response.headersSent) {
+        response.destroy()
+        return
+      }
+      try {
+        response.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' })
+        response.end('internal server error')
+      } catch {
+        response.destroy()
+      }
+    }
+  }
+
+  async function handle(request, response) {
+    let url
+    try {
+      url = new URL(request.url ?? '/', 'http://127.0.0.1')
+    } catch {
+      response.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' })
+      response.end('invalid request target')
+      return
+    }
     if (!authorized(request, url, token)) {
       response.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' })
       response.end('not found')
@@ -88,15 +113,26 @@ export function createHandler(api, token) {
 
     /* A long-poll read must stop waiting when the client hangs up. */
     const controller = new AbortController()
-    request.on('close', () => controller.abort())
+    const onClose = () => { if (!response.writableEnded) controller.abort() }
+    const onAborted = () => controller.abort()
+    response.on('close', onClose)
+    request.on('aborted', onAborted)
+    if (request.aborted || (response.destroyed && !response.writableEnded)) controller.abort()
 
-    const reply = await handleJsonRpc(message, api, { signal: controller.signal })
-    if (reply === null) {
-      response.writeHead(202).end()
-      return
+    try {
+      if (controller.signal.aborted) return
+      const reply = await handleJsonRpc(message, api, { signal: controller.signal })
+      if (controller.signal.aborted || response.destroyed || response.writableEnded) return
+      if (reply === null) {
+        response.writeHead(202).end()
+        return
+      }
+      response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+      response.end(JSON.stringify(reply))
+    } finally {
+      response.off('close', onClose)
+      request.off('aborted', onAborted)
     }
-    response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
-    response.end(JSON.stringify(reply))
   }
 }
 
@@ -245,6 +281,7 @@ export async function callTool(id, params, api, signal) {
               reasoningEffort:
                 typeof args.reasoningEffort === 'string' && args.reasoningEffort !== '' ? args.reasoningEffort : undefined,
               timeoutSeconds,
+              signal,
             }),
           ),
         )

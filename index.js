@@ -58,12 +58,12 @@ export function apply(ctx, config = {}) {
       if (bridge !== undefined) void bridge.close()
       for (const child of state.children) {
         try {
-          child.kill('SIGTERM')
+          if (typeof child.bridgeTerminate === 'function') child.bridgeTerminate()
+          else child.kill('SIGTERM')
         } catch {
           /* Already gone. */
         }
       }
-      state.children.clear()
     }
   }, 'subagent-bridge: mcp endpoint')
 

@@ -297,6 +297,14 @@ Both are plain `SKILL.md` files: YAML frontmatter (`name` + `description`) plus 
 - MCP protocol versions `2025-06-18`, `2025-03-26`, `2024-11-05`; unknown versions fall back to the newest.
 - Requires the public services `sessionController`, `sessions`, `workspaceRegistry`, `userQuestions`. Missing ones surface as explicit tool errors.
 
+## Reliability and recovery
+
+- Every prompt records its session and request ID before dispatch. A lost response is reported as an unknown outcome; inspect `dsh_list_workers` and the existing session before retrying. Explicit refusals restore the previous worker state and do not consume a new slot.
+- Closing releases a slot. A follow-up can reopen the worker after capacity checks; a close during preparation prevents that pending prompt from being sent.
+- Cancelling `dsh_task` cancels its wait, not necessarily the Host's ongoing turn. Use `dsh_wait` to inspect the existing task rather than dispatching it again.
+- Result cursors cannot read assistant text before this bridge's first dispatch to the session. Later cursors can still revisit earlier bridge-dispatched results.
+- On POSIX, reverse CLI cancellation signals the process group and escalates after five seconds. It waits up to ten seconds to confirm termination; an unconfirmed result includes a warning and remains tracked. Windows and descendants that create a separate process group do not have the same process-tree guarantee.
+
 ## Development
 
 ```bash
@@ -320,7 +328,7 @@ src/runners/codex.js  codex exec adapter
 src/runners/claude.js claude -p adapter
 ```
 
-83 tests: handshake and version negotiation, tool list and argument validation, dispatch call shape, result baselines, long polling, real HTTP round trips (404/405/202 and bearer), `codex exec` event parsing, binary resolution, success/failure/timeout runs, resume argument split, final-answer-only behaviour, `dsh_wait` terminal states, slot limits and release, followup rebaselining, registry persistence and restart recovery, `maxHops` and rate limiting, per-`cwd` budgets, workspace creation and reuse, `queue`/`steer` delivery and waiting, anchors for steered answers, Claude output parsing and resume arguments, `assumeDefaults` injection, `pendingQuestion` and `dsh_answer`.
+Tests cover: handshake and version negotiation, tool list and argument validation, dispatch call shape, result baselines, long polling, real HTTP round trips (404/405/202 and bearer), `codex exec` event parsing, binary resolution, success/failure/timeout runs, resume argument split, final-answer-only behaviour, `dsh_wait` terminal states, slot limits and release, followup rebaselining, registry persistence and restart recovery, `maxHops` and rate limiting, per-`cwd` budgets, workspace creation and reuse, `queue`/`steer` delivery and waiting, anchors for steered answers, Claude output parsing and resume arguments, `assumeDefaults` injection, `pendingQuestion` and `dsh_answer`.
 
 ## Related
 

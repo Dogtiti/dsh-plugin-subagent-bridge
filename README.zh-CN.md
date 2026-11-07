@@ -299,6 +299,14 @@ mkdir -p ~/.dsh/skills  && cp -R skills/delegate-to-external-agent ~/.dsh/skills
 - MCP 协议版本 `2025-06-18`、`2025-03-26`、`2024-11-05`；未知版本回落到最新。
 - 依赖公开服务 `sessionController`、`sessions`、`workspaceRegistry`、`userQuestions`；缺失时以明确的工具错误呈现。
 
+## 可靠性与恢复
+
+- 派发前保存会话和请求 ID。响应丢失时标记为结果未知，请先查看 `dsh_list_workers` 和原会话，再决定是否重试。明确拒绝会恢复原记录，并释放新占用的名额。
+- 关闭 worker 会释放名额；后续 follow-up 可以在容量检查后重新打开。准备过程中发生关闭时，不再发送该次待派发消息。
+- 取消 `dsh_task` 会结束等待，但 Host 中的任务可能仍在运行。应使用 `dsh_wait` 查看原任务，避免重复派发。
+- 读取结果的游标不能越过本 bridge 首次派发的历史基线，但可回看此前由 bridge 派发产生的结果。
+- POSIX 上反向 CLI 取消会向进程组发信号，五秒后升级强制终止，最多等待十秒确认。无法确认时返回警告并保留跟踪。Windows 或自行创建独立进程组的后代不具备相同的进程树回收保证。
+
 ## 开发
 
 ```bash
@@ -322,7 +330,7 @@ src/runners/codex.js  codex exec adapter
 src/runners/claude.js claude -p adapter
 ```
 
-83 项测试：握手与版本协商、工具清单与参数校验、派发调用形状、结果基线、长轮询、真实 HTTP 往返（404/405/202 与 bearer）、`codex exec` 事件解析、二进制解析、成功/失败/超时、resume 参数分叉、只回最终回答、`dsh_wait` 终态、名额上限与释放、followup 重基线、注册表持久化与重启恢复、`maxHops` 与速率限制、按 `cwd` 的预算、项目创建与复用、`queue`/`steer` 投递与等待、插话回答的锚点、Claude 输出解析与 resume 参数、`assumeDefaults` 注入、`pendingQuestion` 与 `dsh_answer`。
+测试覆盖：握手与版本协商、工具清单与参数校验、派发调用形状、结果基线、长轮询、真实 HTTP 往返（404/405/202 与 bearer）、`codex exec` 事件解析、二进制解析、成功/失败/超时、resume 参数分叉、只回最终回答、`dsh_wait` 终态、名额上限与释放、followup 重基线、注册表持久化与重启恢复、`maxHops` 与速率限制、按 `cwd` 的预算、项目创建与复用、`queue`/`steer` 投递与等待、插话回答的锚点、Claude 输出解析与 resume 参数、`assumeDefaults` 注入、`pendingQuestion` 与 `dsh_answer`。
 
 ## 相关插件
 

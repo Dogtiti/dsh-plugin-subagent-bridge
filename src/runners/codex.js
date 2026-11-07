@@ -1,11 +1,12 @@
 import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
-import { homedir, tmpdir } from 'node:os'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { CODEX_CANDIDATES } from '../constants.js'
 import { expandHome } from '../settings.js'
 import { ok, text } from '../utils.js'
+import { runChild } from './process.js'
 
 export function resolveCodex(configured) {
   const configuredValue = typeof configured === 'string' ? configured : ''
@@ -60,56 +61,7 @@ export async function runCodex({
   args.push(prompt)
 
   try {
-    const outcome = await new Promise((resolve) => {
-      let child
-      try {
-        /* detached: the CLI becomes a process-group leader, so a timeout can take its own
-         * children down with it instead of leaving them writing files behind us. */
-        child = spawnImpl(bin, args, { cwd: cwd ?? homedir(), stdio: ['ignore', 'pipe', 'pipe'], detached: true })
-      } catch (error) {
-        resolve({ exitCode: -1, stdout: '', stderr: String(error), error: String(error) })
-        return
-      }
-      children?.add(child)
-      let stdout = ''
-      let stderr = ''
-      let settled = false
-      const finish = (value) => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        signal?.removeEventListener?.('abort', abort)
-        children?.delete(child)
-        resolve(value)
-      }
-      const kill = (reason) => {
-        try {
-          child.kill('SIGTERM')
-        } catch {
-          /* Already gone. */
-        }
-        setTimeout(() => {
-          try {
-            child.kill('SIGKILL')
-          } catch {
-            /* Already gone. */
-          }
-        }, 5000).unref?.()
-        finish({ exitCode: -1, stdout, stderr, error: reason })
-      }
-      const timer = setTimeout(() => kill(`codex timed out after ${timeoutMs} ms`), Math.max(1000, timeoutMs ?? 300000))
-      const abort = () => kill('cancelled by the caller')
-      if (signal?.aborted === true) abort()
-      else signal?.addEventListener?.('abort', abort)
-      child.stdout?.on('data', (chunk) => {
-        stdout += chunk.toString('utf8')
-      })
-      child.stderr?.on('data', (chunk) => {
-        stderr += chunk.toString('utf8')
-      })
-      child.on('error', (error) => finish({ exitCode: -1, stdout, stderr, error: error.message }))
-      child.on('close', (code) => finish({ exitCode: code ?? -1, stdout, stderr }))
-    })
+    const outcome = await runChild({ bin, args, cwd, timeoutMs, signal, children, spawnImpl, label: 'codex' })
 
     const parsed = parseCodexOutput(outcome.stdout, await readIfExists(outFile))
     const durationMs = Date.now() - started
@@ -123,7 +75,7 @@ export async function runCodex({
       ...(parsed.threadId === undefined ? {} : { threadId: parsed.threadId }),
       ...(error === undefined ? {} : { error }),
     })
-    if (outcome.error !== undefined) return build(false, outcome.error)
+    if (outcome.error !== undefined) return build(false, `${outcome.error}${outcome.terminationWarning === undefined ? '' : `; ${outcome.terminationWarning}`}`)
     if (outcome.exitCode !== 0) {
       const detail = parsed.error ?? outcome.stderr.trim().split('\n').slice(-3).join('\n')
       return build(false, `codex exited with ${outcome.exitCode}${detail === '' ? '' : `: ${detail}`}`)

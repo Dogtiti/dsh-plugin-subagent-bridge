@@ -325,6 +325,11 @@ test('reports a failing codex run', async () => {
 
 test('kills codex when the run times out', async () => {
   const child = fakeChild({ close: false })
+  child.kill = () => {
+    child.killed = true
+    child.emit('close', null)
+    return true
+  }
   const result = await runCodex({
     bin: '/fake/codex',
     prompt: 'slow',
@@ -1083,18 +1088,24 @@ test('no model argument leaves the session untouched', async () => {
   assert.equal(calls.selectModel.length, 0)
 })
 
-test('workspace: true creates a project for the directory and groups the worker in it', async () => {
+test('workspace: true creates a project for the directory and groups the worker in it', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'bridge-workspace-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const cwd = join(dir, 'new-project')
   const { api, calls } = workerHost()
-  const result = await api.task({ prompt: 'x', cwd: '/repo/new-project', workspace: true })
-  assert.deepEqual(calls.workspaceCreate, [{ path: '/repo/new-project', title: undefined }])
+  const result = await api.task({ prompt: 'x', cwd, workspace: true })
+  assert.deepEqual(calls.workspaceCreate, [{ path: cwd, title: undefined }])
   assert.deepEqual(calls.workspaceAttached[0].attached, [result.sessionId])
   assert.equal(result.workspace.title, 'new-project')
 })
 
-test('a workspace title is passed through', async () => {
+test('a workspace title is passed through', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'bridge-workspace-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const cwd = join(dir, 'p')
   const { api, calls } = workerHost()
-  const result = await api.spawn({ taskName: 'w', message: 'x', forkTurns: 'none', cwd: '/repo/p', workspace: 'Clawer' })
-  assert.deepEqual(calls.workspaceCreate, [{ path: '/repo/p', title: 'Clawer' }])
+  const result = await api.spawn({ taskName: 'w', message: 'x', forkTurns: 'none', cwd, workspace: 'Clawer' })
+  assert.deepEqual(calls.workspaceCreate, [{ path: cwd, title: 'Clawer' }])
   assert.equal(result.workspace.title, 'Clawer')
 })
 
@@ -1420,27 +1431,31 @@ test('wait stops when the caller cancels', async () => {
 })
 
 test('a timed-out run takes the whole process group down', async () => {
-  const { EventEmitter } = await import('node:events')
   const signals = []
   const original = process.kill
+  const child = new EventEmitter()
+  child.pid = 4242
+  child.stdout = new EventEmitter()
+  child.stderr = new EventEmitter()
+  child.kill = () => { throw new Error('must signal the group') }
+  let alive = true
   process.kill = (pid, signal) => {
     signals.push({ pid, signal })
+    if (!alive) throw Object.assign(new Error('gone'), { code: 'ESRCH' })
+    if (signal === 'SIGTERM') {
+      alive = false
+      child.emit('close', null)
+    }
     return true
   }
   try {
     const spawnImpl = (bin, args, options) => {
       assert.equal(options.detached, true, 'the CLI must lead its own process group')
-      const child = new EventEmitter()
-      child.pid = 4242
-      child.stdout = new EventEmitter()
-      child.stderr = new EventEmitter()
-      child.kill = () => {}
       return child
     }
     const result = await runClaude({ bin: '/fake/claude', prompt: 'x', timeoutMs: 20, spawnImpl })
     assert.equal(result.ok, false)
     assert.match(String(result.error), /timed out/)
-    await new Promise((resolve) => setTimeout(resolve, 20))
     assert.deepEqual(signals[0], { pid: -4242, signal: 'SIGTERM' })
   } finally {
     process.kill = original
